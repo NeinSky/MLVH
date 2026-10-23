@@ -20,3 +20,5 @@ latest_silero_models.yml
 *.log
 *.part
 *.tmp
+# рабочие заметки, не для распространения
+HANDOFF.md
