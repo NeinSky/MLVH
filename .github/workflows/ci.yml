@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Только лёгкие зависимости: PySide6 и torch в CI не нужны.
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install edge-tts python-dotenv openai
+
+      - name: Синтаксис
+        run: python -m compileall -q app main.py tools
+
+      - name: Самопроверка
+        run: python tools/selftest.py
+
+      - name: Пример конфига — валидный JSON
+        run: python -c "import json; json.load(open('config.example.json', encoding='utf-8'))"
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Секреты и личные файлы не должны попадать в git
+        run: |
+          status=0
+          # Ключи вида sk-...
+          if git grep -n -I -E 'sk-[A-Za-z0-9]{20,}' -- . ':!*.md'; then
+            echo "::error::Найден похожий на ключ токен"
+            status=1
+          fi
+          # Личные файлы в индексе
+          for path in .env config.json; do
+            if git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+              echo "::error::$path попал в репозиторий"
+              status=1
+            fi
+          done
+          # Тяжёлые каталоги
+          for dir in models wheels samples .venv; do
+            if git ls-files "$dir" | grep -q .; then
+              echo "::error::каталог $dir попал в репозиторий"
+              status=1
+            fi
+          done
+          exit $status
