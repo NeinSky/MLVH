@@ -87,6 +87,28 @@ class ChatWorker(QThread):
         return "".join(parts), usage, finish
 
 
+class PrepareWorker(QThread):
+    """Готовит движок распознавания заранее: грузит модель без запроса."""
+
+    ready = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, engine: ASREngine, settings: ASRSettings, parent=None) -> None:
+        super().__init__(parent)
+        self._engine = engine
+        self._settings = settings
+
+    def run(self) -> None:
+        try:
+            self._engine.prepare(self._settings)
+            device = getattr(self._engine, "device_name", "")
+            self.ready.emit(device or "готово")
+        except ASRError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(f"Модель не загрузилась: {exc}")
+
+
 class TranscribeWorker(QThread):
     """Распознавание в фоне: при первом запуске грузится модель."""
 
@@ -102,9 +124,10 @@ class TranscribeWorker(QThread):
 
     def run(self) -> None:
         try:
-            self.note.emit("Готовлю распознавание…")
+            self.note.emit("Распознаю…")
             self._engine.prepare(self._settings)
-            self.done.emit(self._engine.transcribe(self._samples, self._settings))
+            text = self._engine.transcribe(self._samples, self._settings)
+            self.done.emit(text)
         except ASRError as exc:
             self.failed.emit(str(exc))
         except Exception as exc:  # поток не должен умирать молча

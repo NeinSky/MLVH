@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from html import escape
 from pathlib import Path
 
@@ -69,6 +70,7 @@ from app.ui.mic_dialog import MicDialog
 from app.ui.persona_dialog import PersonaDialog
 from app.ui.workers import (
     ChatWorker,
+    PrepareWorker,
     SpeakWorker,
     SpeechSignals,
     TranscribeWorker,
@@ -143,6 +145,10 @@ class MainWindow(QMainWindow):
         self._wake: WakeWorker | None = None
         self._asr_infos: dict = {}
         self._hotkey_text = normalize_hotkey(self.settings.asr.hotkey)
+        # Запись начата удержанием клавиши: ждём отпускания, а не модификаторов.
+        self._hotkey_down = False
+        self._record_started_at = 0.0
+        self._prepare_worker = None
 
         self._recorder = MicRecorder(self)
         self._recorder.level.connect(self._on_mic_level)
@@ -154,6 +160,10 @@ class MainWindow(QMainWindow):
         self._max_record_timer = QTimer(self)
         self._max_record_timer.setSingleShot(True)
         self._max_record_timer.timeout.connect(self._stop_recording)
+
+        self._record_timer = QTimer(self)
+        self._record_timer.setInterval(500)
+        self._record_timer.timeout.connect(self._tick_recording)
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -184,6 +194,11 @@ class MainWindow(QMainWindow):
         QApplication.instance().installEventFilter(self)
         self._apply_global_hotkey(announce=False)
         QTimer.singleShot(0, self._apply_mic_mode)
+
+        # Модель распознавания грузим в фоне: иначе первый голосовой ввод
+        # выглядит зависшим на 10 секунд.
+        if self.settings.asr.mode != "off":
+            QTimer.singleShot(1200, self._warm_up_asr)
 
         # Локальные модели грузятся заранее: Chatterbox ~20 с, Silero ~4 с.
         if self.settings.tts.engine in ("chatterbox", "silero"):
@@ -935,6 +950,31 @@ class MainWindow(QMainWindow):
         self.settings.asr.engine = engine_id
         self._touch()
         self._refresh_mic_ui()
+        self._warm_up_asr()
+
+    def _warm_up_asr(self) -> None:
+        """Готовим модель заранее: первый «Распознать» не должен ждать загрузки."""
+        info = self._asr_infos.get(self.settings.asr.engine)
+        if info is None or not info.available or self._prepare_worker is not None:
+            return
+
+        engine = get_asr_engine(self.settings.asr.engine)
+        worker = PrepareWorker(engine, self.settings.asr, self)
+        worker.ready.connect(
+            lambda device: self.statusBar().showMessage(
+                f"Распознавание готово ({device})", 4000
+            )
+        )
+        worker.failed.connect(
+            lambda message: self.statusBar().showMessage(f"Распознавание: {message}", 8000)
+        )
+        worker.finished.connect(self._forget_prepare_worker)
+        worker.finished.connect(worker.deleteLater)
+        self._prepare_worker = worker
+        worker.start()
+
+    def _forget_prepare_worker(self) -> None:
+        self._prepare_worker = None
 
     def _on_asr_model_changed(self, model: str) -> None:
         if not model:
@@ -1183,11 +1223,26 @@ class MainWindow(QMainWindow):
 
         self._recorder.begin_capture()
         self._recording = True
+        self._record_started_at = time.monotonic()
         self._max_record_timer.start(max(3, int(self.settings.asr.max_seconds)) * 1000)
+        self._record_timer.start()
         self._set_mic_state("recording")
-        self.statusBar().showMessage(
-            f"Слушаю… ({self.settings.asr.hotkey} — стоп, Esc — отмена)"
-        )
+        self.statusBar().showMessage(self._recording_hint())
+
+    def _recording_hint(self) -> str:
+        if self.settings.asr.global_hotkey:
+            return (
+                f"Запись идёт. Нажмите {self.settings.asr.hotkey} ещё раз, "
+                "чтобы остановить (Esc — отмена)"
+            )
+        return f"Запись идёт. Отпустите {self.settings.asr.hotkey} — распознаю (Esc — отмена)"
+
+    def _tick_recording(self) -> None:
+        if not self._recording:
+            return
+        elapsed = time.monotonic() - self._record_started_at
+        limit = max(3, int(self.settings.asr.max_seconds))
+        self.statusBar().showMessage(f"{self._recording_hint()} · {elapsed:.0f} из {limit} с")
 
     def _stop_recording(self) -> None:
         if not self._recording:
@@ -1195,6 +1250,7 @@ class MainWindow(QMainWindow):
 
         self._recording = False
         self._max_record_timer.stop()
+        self._record_timer.stop()
         samples = self._recorder.end_capture()
         rate = self._recorder.rate
         self._recorder.stop()
@@ -1216,7 +1272,9 @@ class MainWindow(QMainWindow):
         if not self._recording:
             return
         self._recording = False
+        self._hotkey_down = False
         self._max_record_timer.stop()
+        self._record_timer.stop()
         self._recorder.end_capture()
         self._recorder.stop()
         self._set_mic_state("idle")
@@ -1271,12 +1329,28 @@ class MainWindow(QMainWindow):
         self._transcribe_worker = None
 
     def _matches_hotkey(self, event) -> bool:
+        """Совпадает ли событие с комбинацией (модификаторы учитываются)."""
         if not self._hotkey_text:
             return False
         text = QKeySequence(event.keyCombination()).toString(
             QKeySequence.SequenceFormat.PortableText
         )
         return normalize_hotkey(text) == self._hotkey_text
+
+    def _hotkey_key(self) -> Qt.Key:
+        """Клавиша комбинации без модификаторов — для проверки отпускания."""
+        sequence = QKeySequence(self.settings.asr.hotkey)
+        if sequence.count() == 0:
+            return Qt.Key.Key_unknown
+        return sequence[0].key()
+
+    def _is_hotkey_key(self, event) -> bool:
+        """Отпускание самой клавиши.
+
+        Windows и Qt присылают KeyRelease уже без модификаторов, если их
+        отпустили первыми, поэтому здесь модификаторы не проверяем.
+        """
+        return self._hotkey_key() != Qt.Key.Key_unknown and event.key() == self._hotkey_key()
 
     def eventFilter(self, obj, event) -> bool:
         """Хоткей в окне: нажали — пишем, отпустили — распознаём."""
@@ -1286,13 +1360,23 @@ class MainWindow(QMainWindow):
                     self._cancel_recording()
                     return True
                 if self._matches_hotkey(event):
-                    if not event.isAutoRepeat():
+                    if not event.isAutoRepeat() and not self._recording:
+                        self._hotkey_down = True
                         self._start_recording()
                     return True
-            elif event.type() == QEvent.Type.KeyRelease and self._matches_hotkey(event):
-                if not event.isAutoRepeat():
+            elif event.type() == QEvent.Type.KeyRelease:
+                if self._hotkey_down and self._is_hotkey_key(event):
+                    self._hotkey_down = False
                     self._stop_recording()
-                return True
+                    return True
+            elif event.type() in (
+                QEvent.Type.WindowDeactivate,
+                QEvent.Type.ApplicationDeactivate,
+            ):
+                # Отпускание могло уйти другому окну — не оставляем запись висеть.
+                if self._hotkey_down:
+                    self._hotkey_down = False
+                    self._stop_recording()
 
         return super().eventFilter(obj, event)
 
@@ -1786,6 +1870,7 @@ class MainWindow(QMainWindow):
         self._stop_pipeline(wait=True)
         self._stop_thread(self._chat_worker, 3000)
         self._stop_thread(self._transcribe_worker, 3000)
+        self._stop_thread(self._prepare_worker, 3000)
         self._persist()
         self.tts.stop()
         self._stop_thread(self._speak_worker, 2000)
