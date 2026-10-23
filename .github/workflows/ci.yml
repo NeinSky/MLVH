@@ -7,13 +7,16 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Версии actions держим на Node 24: checkout v5+ и setup-python v6+.
+# v4 и v5 соответственно ещё работают на Node 20 и дают предупреждение.
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
@@ -37,7 +40,7 @@ jobs:
   secrets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Секреты и личные файлы не должны попадать в git
         run: |
