@@ -24,6 +24,7 @@ class MicRecorder(QObject):
     """
 
     level = Signal(float)
+    chunk = Signal(object)   # float32 моно: для режима «Слушать микрофон»
     failed = Signal(str)
 
     def __init__(self, parent=None) -> None:
@@ -32,6 +33,7 @@ class MicRecorder(QObject):
         self._io = None
         self._chunks: list[np.ndarray] = []
         self._capturing = False
+        self._stream = False
         self._rate = audio.TARGET_RATE
         self._channels = 1
         self._sample_format = QAudioFormat.SampleFormat.Int16
@@ -70,8 +72,12 @@ class MicRecorder(QObject):
     def device_name(self) -> str:
         return self._device_name
 
-    def start(self, device_name: str = "") -> bool:
-        """Открываем микрофон. Уровень начинает идти сразу."""
+    def start(self, device_name: str = "", stream: bool = False) -> bool:
+        """Открываем микрофон. Уровень начинает идти сразу.
+
+        stream=True — каждый кусок уходит в сигнал `chunk` (режим спецслова),
+        иначе копим буфер только между begin_capture() и end_capture().
+        """
         if self._source is not None:
             return True
 
@@ -104,12 +110,14 @@ class MicRecorder(QObject):
         self._device_name = device.description()
         self._chunks = []
         self._capturing = False
+        self._stream = stream
         self._timer.start()
         return True
 
     def stop(self) -> None:
         self._timer.stop()
         self._capturing = False
+        self._stream = False
         source = self._source
         self._source = None
         self._io = None
@@ -157,6 +165,8 @@ class MicRecorder(QObject):
             return
         if self._capturing:
             self._chunks.append(samples)
+        if self._stream:
+            self.chunk.emit(samples)
         self.level.emit(audio.level(audio.rms(samples)))
 
     def _convert(self, data: bytes) -> np.ndarray:

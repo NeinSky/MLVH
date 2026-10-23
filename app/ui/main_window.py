@@ -39,6 +39,7 @@ from app.asr.hotkeys import normalize as normalize_hotkey
 from app.asr.hotkeys import parse as parse_hotkey
 from app.asr.recorder import MicRecorder
 from app.asr.registry import asr_engine_infos, get_asr_engine
+from app.asr.wake import WakeWorker, strip_wake_word
 from app.asr.whisper_engine import MODELS as WHISPER_MODELS
 from app.config import (
     ASR_MODES,
@@ -139,6 +140,7 @@ class MainWindow(QMainWindow):
         # --- микрофон и распознавание ---
         self._recording = False
         self._transcribe_worker: TranscribeWorker | None = None
+        self._wake: WakeWorker | None = None
         self._asr_infos: dict = {}
         self._hotkey_text = normalize_hotkey(self.settings.asr.hotkey)
 
@@ -181,6 +183,7 @@ class MainWindow(QMainWindow):
         # Хоткей в окне ловим фильтром событий: так работает и удержание.
         QApplication.instance().installEventFilter(self)
         self._apply_global_hotkey(announce=False)
+        QTimer.singleShot(0, self._apply_mic_mode)
 
         # Локальные модели грузятся заранее: Chatterbox ~20 с, Silero ~4 с.
         if self.settings.tts.engine in ("chatterbox", "silero"):
@@ -869,11 +872,20 @@ class MainWindow(QMainWindow):
             self.asr_hint.setText("")
         elif not info.available:
             self.asr_hint.setText(f"{info.title}: {info.reason}. {info.hint}")
+        elif asr.mode == "wake":
+            self.asr_hint.setText(
+                f"Слушаю «{asr.wake_word}». Говорите вместе с вопросом: "
+                f"«{asr.wake_word}, сколько времени?». Если имя не ловится — "
+                "попробуйте слово попроще: «помощник»."
+            )
         else:
             self.asr_hint.setText(info.hint.replace("\n", " "))
 
         if not self._recording and not self._is_running(self._transcribe_worker):
-            self.mic_meter.set_state("ready" if enabled else "idle")
+            if enabled and asr.mode == "wake" and self._wake is not None:
+                self.mic_meter.set_state("listening")
+            else:
+                self.mic_meter.set_state("ready" if enabled else "idle")
 
     def _on_mic_mode_changed(self, index: int) -> None:
         if index < 0:
@@ -900,6 +912,7 @@ class MainWindow(QMainWindow):
         self._touch()
         self._apply_global_hotkey()
         self._refresh_mic_ui()
+        self._apply_mic_mode()
 
     def _on_asr_engine_changed(self, index: int) -> None:
         if index < 0:
@@ -935,10 +948,16 @@ class MainWindow(QMainWindow):
 
     def _on_wake_word(self) -> None:
         word = self.wake_word_edit.text().strip().lower() or "элви"
+        changed = word != self.settings.asr.wake_word
         self.wake_word_edit.setText(word)
         self.settings.asr.wake_word = word
         self._touch()
         self._refresh_mic_ui()
+
+        # Слушатель запоминает слово при старте — перезапускаем его.
+        if changed and self.settings.asr.mode == "wake" and self._wake is not None:
+            self._stop_wake_listening()
+            self._start_wake_listening()
 
     def _on_hotkey_changed(self) -> None:
         text = self.hotkey_edit.keySequence().toString(
@@ -1000,6 +1019,102 @@ class MainWindow(QMainWindow):
         self._touch()
         self._refresh_mic_ui()
 
+    # --- режим «Слушать микрофон» ---------------------------------------
+    def _apply_mic_mode(self) -> None:
+        """Приводим микрофон к текущему режиму: слушаем спецслово или нет."""
+        if self.settings.asr.mode == "wake":
+            self._start_wake_listening()
+        else:
+            self._stop_wake_listening()
+
+    def _start_wake_listening(self) -> None:
+        if self._wake is not None:
+            return
+
+        info = self._asr_infos.get("vosk")
+        if info is None or not info.available:
+            self.statusBar().showMessage(
+                "Для режима «Слушать микрофон» нужен Vosk: .\\install_asr.ps1", 8000
+            )
+            return
+        if not self._recorder.start(self.settings.asr.input_device, stream=True):
+            return
+
+        worker = WakeWorker(self.settings.asr, self)
+        worker.ready.connect(
+            lambda: self.statusBar().showMessage(
+                f"Слушаю спецслово «{self.settings.asr.wake_word}»", 4000
+            )
+        )
+        worker.heard.connect(self._on_wake_heard)
+        worker.detected.connect(self._on_wake_detected)
+        worker.failed.connect(self._on_wake_failed)
+        self._wake = worker
+        self._recorder.chunk.connect(self._feed_wake)
+        worker.start()
+        self._set_mic_state("listening")
+
+    def _stop_wake_listening(self) -> None:
+        worker = self._wake
+        if worker is not None:
+            try:
+                self._recorder.chunk.disconnect(self._feed_wake)
+            except (RuntimeError, TypeError):
+                pass
+            worker.stop()
+            if not worker.wait(3000):
+                worker.terminate()
+                worker.wait(500)
+            self._wake = None
+
+        if self._recorder.is_open and not self._recording:
+            self._recorder.stop()
+        if not self._recording:
+            self._refresh_mic_ui()
+
+    def _feed_wake(self, samples) -> None:
+        """Куски аудио уходят в Vosk, но не пока MLVH говорит."""
+        if self._wake is None:
+            return
+        if self.settings.asr.mute_while_speaking and self._is_speaking():
+            return
+        self._wake.feed(samples)
+
+    def _on_wake_heard(self) -> None:
+        QApplication.beep()
+        self.mic_meter.set_state("recording")
+        self.statusBar().showMessage("Слушаю вопрос…")
+
+    def _on_wake_detected(self, samples, rest: str) -> None:
+        self.mic_meter.set_state("busy")
+        self.statusBar().showMessage(f"Услышал: {rest}")
+
+        data = audio.to_mono_16k(samples, audio.TARGET_RATE, 1)
+        if data.size == 0:
+            self.mic_meter.set_state("listening")
+            return
+
+        whisper = self._asr_infos.get("whisper")
+        if whisper is not None and whisper.available:
+            self._transcribe_samples(data)
+        else:
+            # Без whisper берём текст Vosk: грубее, но без лишней модели.
+            self._on_transcribed(rest)
+
+    def _on_wake_failed(self, message: str) -> None:
+        self.statusBar().showMessage(message, 8000)
+        self.settings.asr.mode = "push"
+        self._touch()
+        self._stop_wake_listening()
+        self._apply_settings()
+
+    def _idle_mic_state(self) -> None:
+        """После распознавания возвращаемся в «слушаю» или в покой."""
+        if self.settings.asr.mode == "wake" and self._wake is not None:
+            self._set_mic_state("listening")
+        else:
+            self._set_mic_state("idle")
+
     # --- запись и распознавание -----------------------------------------
     def _set_mic_state(self, state: str) -> None:
         self.mic_meter.set_state(state)
@@ -1034,6 +1149,10 @@ class MainWindow(QMainWindow):
 
     def _toggle_recording(self) -> None:
         """Клик по кнопке и глобальная клавиша: нажал — пишу, нажал — стоп."""
+        if self.settings.asr.mode == "wake":
+            word = self.settings.asr.wake_word
+            self.statusBar().showMessage(f"Скажите: «{word}, ваш вопрос»", 4000)
+            return
         if self._recording:
             self._stop_recording()
         else:
@@ -1041,6 +1160,11 @@ class MainWindow(QMainWindow):
 
     def _start_recording(self) -> None:
         if self._recording:
+            return
+
+        if self.settings.asr.mode == "wake":
+            word = self.settings.asr.wake_word
+            self.statusBar().showMessage(f"Скажите: «{word}, ваш вопрос»", 4000)
             return
 
         problem = self._mic_problem()
@@ -1116,8 +1240,15 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_transcribed(self, text: str) -> None:
-        self._set_mic_state("idle")
+        self._idle_mic_state()
         text = text.strip()
+
+        # В режиме спецслова имя могло попасть в распознанный текст.
+        if self.settings.asr.mode == "wake":
+            stripped = strip_wake_word(text, self.settings.asr.wake_word)
+            if stripped is not None:
+                text = stripped.strip()
+
         if not text:
             self.statusBar().showMessage("Не расслышал — попробуйте ещё раз", 4000)
             return
@@ -1133,7 +1264,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Распознано — проверьте и отправьте", 5000)
 
     def _on_transcribe_failed(self, message: str) -> None:
-        self._set_mic_state("idle")
+        self._idle_mic_state()
         self.statusBar().showMessage(f"Распознавание: {message}", 8000)
 
     def _forget_transcribe_worker(self) -> None:
@@ -1646,6 +1777,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._stop_all()
+        self._stop_wake_listening()
         self._recorder.stop()
         self._global_hotkey.unregister()
         app = QApplication.instance()

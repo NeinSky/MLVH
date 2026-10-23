@@ -242,6 +242,36 @@ def test_asr_registry() -> None:
         check(f"{info.id}: есть описание", bool(info.title), info.title)
 
 
+def test_wake_word() -> None:
+    print("спецслово:")
+    from app.asr.wake import levenshtein, strip_wake_word
+
+    check("Левенштейн: одна замена", levenshtein("элви", "элвис") == 1,
+          str(levenshtein("элви", "элвис")))
+
+    cases = (
+        ("Элви, в каком году было восстание декабристов?",
+         "в каком году было восстание декабристов?"),
+        ("элвис сколько времени", "сколько времени"),
+        ("эй элвин расскажи анекдот", "расскажи анекдот"),
+        ("эл ви что такое фотосинтез", "что такое фотосинтез"),
+        ("Элли, какая сегодня погода?", "какая сегодня погода?"),
+    )
+    for text, expected in cases:
+        actual = strip_wake_word(text, "элви")
+        check(f"срезано: {text[:24]!r}", actual == expected, f"{actual!r} != {expected!r}")
+
+    check("только спецслово", strip_wake_word("Элви.", "элви") == "",
+          repr(strip_wake_word("Элви.", "элви")))
+    check("обычная фраза не срабатывает",
+          strip_wake_word("Привет, как дела?", "элви") is None)
+    check("«эльвира» не срабатывает",
+          strip_wake_word("Эльвира пришла домой.", "элви") is None)
+    check("другое спецслово",
+          strip_wake_word("Помощник, сколько времени?", "помощник") == "сколько времени?",
+          repr(strip_wake_word("Помощник, сколько времени?", "помощник")))
+
+
 def test_version() -> None:
     print("версия:")
     import re
@@ -284,6 +314,7 @@ def main() -> int:
         test_hotkeys,
         test_asr_audio,
         test_asr_registry,
+        test_wake_word,
         test_version,
         test_audio_helpers,
         test_example_config,
