@@ -151,6 +151,9 @@ class MainWindow(QMainWindow):
         self._record_started_at = 0.0
         self._prepare_worker = None
         self._asr_warm_pending = False
+        self._echo_guard_until = 0.0
+        self._transcribe_started_at = 0.0
+        self._closing = False
 
         self._recorder = MicRecorder(self)
         self._recorder.level.connect(self._on_mic_level)
@@ -168,6 +171,7 @@ class MainWindow(QMainWindow):
         self._record_timer.timeout.connect(self._tick_recording)
 
         self._wake_restarts = 0
+        self._mic_dead_ticks = 0
         self._wake_pending = None   # поток, который ещё завершается после stop()
         self._mic_watchdog_timer = QTimer(self)
         self._mic_watchdog_timer.setInterval(2000)
@@ -1085,6 +1089,14 @@ class MainWindow(QMainWindow):
     def _apply_mic_mode(self) -> None:
         """Приводим микрофон к текущему режиму: слушаем спецслово или нет."""
         if self.settings.asr.mode == "wake":
+            alive = (
+                self._wake is not None
+                and self._wake.isRunning()
+                and self._recorder.is_streaming
+            )
+            if alive:
+                self._set_mic_state("listening")
+                return
             self._start_wake_listening()
         else:
             self._stop_wake_listening()
@@ -1133,7 +1145,8 @@ class MainWindow(QMainWindow):
         """Режим включён, но микрофон или слушатель умер — поднимаем заново.
 
         Без этого одно неудачное открытие устройства (занято другой программой,
-        переключение режима) оставляло MLVH «глухим» до перезапуска.
+        переключение режима, усыпление потока после озвучки) оставляло MLVH
+        «глухим» до перезапуска.
         """
         if self.settings.asr.mode != "wake":
             return
@@ -1144,7 +1157,15 @@ class MainWindow(QMainWindow):
 
         alive = self._wake is not None and self._wake.isRunning()
         if alive and self._recorder.is_streaming:
-            return
+            # Поток захвата мог уснуть: считаем пустые циклы и перезапускаем.
+            if self._recorder.is_active:
+                self._mic_dead_ticks = 0
+                return
+            self._mic_dead_ticks += 1
+            if self._mic_dead_ticks < 3:
+                return
+            self.statusBar().showMessage("Микрофон уснул — перезапускаю…", 4000)
+        self._mic_dead_ticks = 0
 
         if self._wake_restarts > 20:
             self.statusBar().showMessage(
@@ -1194,7 +1215,10 @@ class MainWindow(QMainWindow):
         if self.settings.asr.mute_while_speaking and self._is_speaking():
             return
         if self._is_running(self._transcribe_worker):
-            return
+            # Распознавание не должно глушить микрофон навсегда: если движок
+            # завис, через 45 секунд снова слушаем.
+            if time.monotonic() - self._transcribe_started_at < 45:
+                return
         self._wake.feed(samples)
 
     def _on_wake_heard(self) -> None:
@@ -1263,9 +1287,16 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message, 8000)
 
     def _is_speaking(self) -> bool:
-        if self._pipeline is not None and self._pipeline.is_running:
+        """Идёт ли звук из колонок (плюс полсекунды запаса на эхо).
+
+        Раньше здесь проверялось «поток озвучки жив». Из-за этого микрофон
+        глушился, пока существовал конвейер, — в том числе после «Стоп» и
+        после того, как ответ давно дочитан.
+        """
+        if self.tts.is_playing:
+            self._echo_guard_until = time.monotonic() + 0.5
             return True
-        return self._is_running(self._speak_worker)
+        return time.monotonic() < self._echo_guard_until
 
     def _mic_problem(self) -> str:
         asr = self.settings.asr
@@ -1382,6 +1413,7 @@ class MainWindow(QMainWindow):
         worker.finished.connect(worker.deleteLater)
         self._transcribe_worker = worker
 
+        self._transcribe_started_at = time.monotonic()
         self._set_mic_state("busy")
         self.statusBar().showMessage("Распознаю…")
         worker.start()
@@ -1912,7 +1944,14 @@ class MainWindow(QMainWindow):
             self._chat_worker.cancel()
         self._stop_pipeline()
         self.tts.stop()
+        self._echo_guard_until = 0.0
+        # «Стоп» должен и озвучку остановить, и сразу вернуть микрофон к работе.
+        if self._is_running(self._speak_worker):
+            self._speak_worker.wait(1500)
         self._set_busy(False)
+        self._set_mic_state("listening" if self.settings.asr.mode == "wake" else "idle")
+        if not self._closing:
+            self._apply_mic_mode()
         self.statusBar().showMessage("Остановлено", 3000)
 
     def _clear_chat(self) -> None:
@@ -1949,6 +1988,7 @@ class MainWindow(QMainWindow):
             worker.wait(1000)
 
     def closeEvent(self, event) -> None:
+        self._closing = True
         self._stop_all()
         self._stop_wake_listening(wait_ms=4000)
         pending = self._wake_pending

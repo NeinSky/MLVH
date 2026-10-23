@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
-from PySide6.QtMultimedia import QAudioFormat, QAudioSource, QMediaDevices
+from PySide6.QtMultimedia import QAudioFormat, QAudioSource, QMediaDevices, QtAudio
 
 from app.asr import audio
 
@@ -67,6 +67,25 @@ class MicRecorder(QObject):
     @property
     def is_streaming(self) -> bool:
         return self._source is not None and self._stream
+
+    @property
+    def is_active(self) -> bool:
+        """Живёт ли поток захвата.
+
+        После переключения аудиосессии (например, когда MLVH говорит через
+        pygame) Windows иногда усыпляет микрофон, и он молча перестаёт отдавать
+        данные. Сторожевой таймер окна перезапускает запись в этом случае.
+
+        В pull-режиме Qt обычно сообщает IdleState — это норма, а не сбой.
+        Плохие состояния: Suspended и Stopped.
+        """
+        if self._source is None:
+            return False
+        try:
+            state = self._source.state()
+        except RuntimeError:
+            return False
+        return state in (QtAudio.State.ActiveState, QtAudio.State.IdleState)
 
     def set_stream(self, enabled: bool) -> None:
         """Включаем или выключаем потоковую отдачу кусков без переоткрытия."""

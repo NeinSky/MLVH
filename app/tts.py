@@ -274,8 +274,18 @@ class TTSService:
 
     def __init__(self) -> None:
         self._stop = threading.Event()
+        self._playing = threading.Event()
         self._pygame_ready = False
         self._play_lock = threading.Lock()
+
+    @property
+    def is_playing(self) -> bool:
+        """Идёт ли звук прямо сейчас.
+
+        Именно звук, а не «поток озвучки жив»: синтез следующей фразы и
+        подвисший поток не должны глушить микрофон.
+        """
+        return self._playing.is_set()
 
     # --- голоса ---------------------------------------------------------
     @staticmethod
@@ -338,8 +348,10 @@ class TTSService:
                     self._pygame_ready = True
                 pygame.mixer.music.load(str(path))
                 pygame.mixer.music.set_volume(max(0.0, min(1.0, volume)))
+                self._playing.set()
                 pygame.mixer.music.play()
             except Exception as exc:
+                self._playing.clear()
                 raise TTSError(f"Не удалось воспроизвести звук: {exc}") from exc
 
             try:
@@ -349,6 +361,7 @@ class TTSService:
                         break
                     time.sleep(0.05)
             finally:
+                self._playing.clear()
                 # Без unload() файл остаётся занятым и его нельзя удалить.
                 try:
                     pygame.mixer.music.unload()
@@ -478,6 +491,7 @@ class TTSService:
     def stop(self) -> None:
         """Прерываем речь: следующий play() сразу завершится."""
         self._stop.set()
+        self._playing.clear()
         try:
             import pygame
 
@@ -489,6 +503,7 @@ class TTSService:
     def reset(self) -> None:
         """Снимаем флаг остановки перед новой озвучкой."""
         self._stop.clear()
+        self._playing.clear()
 
     @staticmethod
     def clear_cache() -> None:
