@@ -9,10 +9,11 @@ on:
 
 # Версии actions держим на Node 24: checkout v5+ и setup-python v6+.
 # v4 и v5 соответственно ещё работают на Node 20 и дают предупреждение.
+# Раннер прибит к 24.04: у ubuntu-latest с 19.10.2026 идёт миграция на Ubuntu 26.
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -38,7 +39,7 @@ jobs:
         run: python -c "import json; json.load(open('config.example.json', encoding='utf-8'))"
 
   secrets:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
