@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -244,7 +245,7 @@ def test_asr_registry() -> None:
 
 def test_wake_word() -> None:
     print("спецслово:")
-    from app.asr.wake import levenshtein, strip_wake_word
+    from app.asr.wakeword import levenshtein, strip_wake_word
 
     check("Левенштейн: одна замена", levenshtein("элви", "элвис") == 1,
           str(levenshtein("элви", "элвис")))
@@ -270,6 +271,36 @@ def test_wake_word() -> None:
     check("другое спецслово",
           strip_wake_word("Помощник, сколько времени?", "помощник") == "сколько времени?",
           repr(strip_wake_word("Помощник, сколько времени?", "помощник")))
+
+
+def test_core_without_qt() -> None:
+    """В CI PySide6 не ставится: ядро не должно его тянуть даже косвенно."""
+    print("ядро без Qt:")
+    code = (
+        "import sys;"
+        "import app.config, app.personas, app.text_norm;"
+        "import app.asr.audio, app.asr.base, app.asr.hotkeys;"
+        "import app.asr.wakeword, app.asr.registry;"
+        "print('PySide6' in sys.modules)"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        check("ядро импортируется без Qt", False, str(exc))
+        return
+
+    if result.returncode != 0:
+        tail = (result.stderr or "").strip().splitlines()[-1:]
+        check("ядро импортируется без Qt", False, " ".join(tail))
+        return
+
+    check("ядро не тянет PySide6", result.stdout.strip() == "False", result.stdout.strip())
 
 
 def test_version() -> None:
@@ -315,6 +346,7 @@ def main() -> int:
         test_asr_audio,
         test_asr_registry,
         test_wake_word,
+        test_core_without_qt,
         test_version,
         test_audio_helpers,
         test_example_config,

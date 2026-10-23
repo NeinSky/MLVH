@@ -40,7 +40,8 @@ from app.asr.hotkeys import normalize as normalize_hotkey
 from app.asr.hotkeys import parse as parse_hotkey
 from app.asr.recorder import MicRecorder
 from app.asr.registry import asr_engine_infos, get_asr_engine
-from app.asr.wake import WakeWorker, strip_wake_word
+from app.asr.wake import WakeWorker
+from app.asr.wakeword import strip_wake_word
 from app.asr.whisper_engine import MODELS as WHISPER_MODELS
 from app.config import (
     ASR_MODES,
