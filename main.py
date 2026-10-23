@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
+from pathlib import Path
 
 from app import __version__
 from app.config import Settings, get_api_key, load_settings
@@ -43,11 +45,29 @@ def main() -> int:
         help="характер: elvi (по умолчанию), helper, anime, mentor, ironic или свой из config.json",
     )
     parser.add_argument("--list-personas", action="store_true", help="показать характеры и выйти")
+    parser.add_argument(
+        "--mic-test",
+        nargs="?",
+        const=3.0,
+        type=float,
+        metavar="SECONDS",
+        help="записать с микрофона и показать уровень (по умолчанию 3 с)",
+    )
+    parser.add_argument(
+        "--transcribe",
+        metavar="FILE",
+        help="распознать wav-файл и выйти",
+    )
     args = parser.parse_args()
 
     settings = load_settings()
     if args.no_voice:
         settings.tts.enabled = False
+
+    if args.mic_test:
+        return _mic_test(args.mic_test)
+    if args.transcribe:
+        return _transcribe_file(args.transcribe, settings)
 
     if args.list_personas:
         return _list_personas(settings)
@@ -107,6 +127,94 @@ def _say(text: str, settings: Settings, args: argparse.Namespace) -> int:
     except TTSError as exc:
         print(f"Ошибка: {exc}")
         return 1
+    return 0
+
+
+def _mic_test(seconds: float) -> int:
+    """Проверка микрофона без окна: устройства, уровень, файл для прослушивания."""
+    from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
+
+    from app.asr import audio
+    from app.asr.recorder import MicRecorder
+
+    QCoreApplication.instance() or QCoreApplication(sys.argv)
+
+    devices = MicRecorder.devices()
+    if not devices:
+        print("Микрофон не найден.")
+        return 1
+    print("Устройства ввода:")
+    for name in devices:
+        print(f"  - {name}")
+
+    recorder = MicRecorder()
+    loop = QEventLoop()
+    errors: list[str] = []
+    recorder.failed.connect(lambda message: (errors.append(message), loop.quit()))
+
+    if not recorder.start():
+        print(f"Ошибка: {errors[-1] if errors else 'не удалось открыть микрофон'}")
+        return 1
+
+    print(f"Запись {seconds:.0f} с — говорите…")
+    recorder.begin_capture()
+    QTimer.singleShot(int(seconds * 1000), loop.quit)
+    loop.exec()
+
+    samples = recorder.end_capture()
+    rate = recorder.rate
+    recorder.stop()
+
+    if samples.size == 0:
+        print("Ничего не записалось.")
+        return 1
+
+    data = audio.to_mono_16k(samples, rate, 1)
+    print(
+        f"Записано: {data.size / audio.TARGET_RATE:.2f} с, "
+        f"пик {audio.peak(data):.3f}, RMS {audio.rms(data):.3f}"
+    )
+    path = Path(tempfile.gettempdir()) / "mlvh_mic_test.wav"
+    audio.write_wav(path, data)
+    print(f"Файл: {path}")
+
+    if audio.rms(data) < 0.004:
+        print("Похоже на тишину: проверьте устройство и разрешение Windows.")
+        return 1
+    return 0
+
+
+def _transcribe_file(path: str, settings: Settings) -> int:
+    """Распознаём готовый wav: удобно проверять движок без микрофона."""
+    from app.asr import audio
+    from app.asr.registry import get_asr_engine
+
+    source = Path(path)
+    if not source.exists():
+        print(f"Файл не найден: {source}")
+        return 1
+
+    engine = get_asr_engine(settings.asr.engine)
+    info = engine.probe()
+    if not info.available:
+        print(f"{info.title} недоступен: {info.reason or info.hint}")
+        return 1
+
+    try:
+        samples, rate = audio.read_wav(source)
+    except (OSError, ValueError) as exc:
+        print(f"Не удалось прочитать wav: {exc}")
+        return 1
+
+    data = audio.to_mono_16k(samples, rate, 1)
+    print(f"Распознаю {data.size / audio.TARGET_RATE:.1f} с через {info.title}…")
+    try:
+        text = engine.transcribe(data, settings.asr)
+    except Exception as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+
+    print(text or "(пусто)")
     return 0
 
 

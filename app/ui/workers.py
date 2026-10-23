@@ -1,15 +1,18 @@
-"""Фоновые задачи: запрос к DeepSeek, список голосов, озвучка.
+"""Фоновые задачи: запрос к DeepSeek, список голосов, озвучка, распознавание.
 
-Qt-интерфейс нельзя блокировать сетью и синтезом, поэтому всё тяжёлое живёт в QThread.
+Qt-интерфейс нельзя блокировать сетью, синтезом и моделями, поэтому всё тяжёлое
+живёт в QThread.
 """
 
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from app.config import TTSSettings
+from app.asr.base import ASREngine, ASRError
+from app.config import ASRSettings, TTSSettings
 from app.deepseek_client import DeepSeekClient, DeepSeekError
 from app.tts import TTSError, TTSService
 
@@ -82,6 +85,52 @@ class ChatWorker(QThread):
             elif event.kind == "usage" and event.usage:
                 usage = event.usage
         return "".join(parts), usage, finish
+
+
+class TranscribeWorker(QThread):
+    """Распознавание в фоне: при первом запуске грузится модель."""
+
+    note = Signal(str)
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, engine: ASREngine, samples, settings: ASRSettings, parent=None) -> None:
+        super().__init__(parent)
+        self._engine = engine
+        self._samples = samples
+        self._settings = settings
+
+    def run(self) -> None:
+        try:
+            self.note.emit("Готовлю распознавание…")
+            self._engine.prepare(self._settings)
+            self.done.emit(self._engine.transcribe(self._samples, self._settings))
+        except ASRError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # поток не должен умирать молча
+            self.failed.emit(f"Ошибка распознавания: {exc}")
+
+
+class PlayFileWorker(QThread):
+    """Проигрывание готового файла: проверка записи с микрофона."""
+
+    finished_ok = Signal()
+    failed = Signal(str)
+
+    def __init__(self, tts: TTSService, path: Path, volume: float = 0.9, parent=None) -> None:
+        super().__init__(parent)
+        self._tts = tts
+        self._path = path
+        self._volume = volume
+
+    def run(self) -> None:
+        try:
+            self._tts.play(self._path, self._volume)
+            self.finished_ok.emit()
+        except TTSError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(f"Ошибка воспроизведения: {exc}")
 
 
 class VoiceListWorker(QThread):

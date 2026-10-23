@@ -82,12 +82,52 @@ class TTSSettings:
         return cls(**_known_values(cls, data))
 
 
+ASR_MODES = ("off", "push", "wake")
+ASR_MODE_TITLES = {
+    "off": "Без микрофона",
+    "push": "По нажатию",
+    "wake": "Слушать микрофон",
+}
+
+
+@dataclass
+class ASRSettings:
+    """Распознавание речи: режим, движок, горячая клавиша."""
+
+    mode: str = "push"                  # off / push / wake
+    engine: str = "whisper"             # whisper / vosk
+    model: str = "small"                # tiny, base, small, medium, large-v3
+    device: str = "cuda"                # cuda / cpu
+    compute_type: str = "int8_float16"
+    language: str = "ru"
+    hotkey: str = "Ctrl+Space"
+    global_hotkey: bool = False         # ловить клавишу, даже когда окно не в фокусе
+    auto_send: bool = False             # отправлять сразу после распознавания
+    wake_word: str = "элви"             # спецслово для режима «Слушать микрофон»
+    input_device: str = ""              # пусто — устройство по умолчанию
+    max_seconds: int = 30               # предел одной записи
+    mute_while_speaking: bool = True    # не слушать, пока MLVH говорит
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ASRSettings":
+        settings = cls(**_known_values(cls, data))
+        if settings.mode not in ASR_MODES:
+            print(
+                f"[config] Неизвестный режим микрофона «{settings.mode}» — "
+                "включён режим «По нажатию»."
+            )
+            settings.mode = "push"
+        settings.max_seconds = max(3, min(120, int(settings.max_seconds or 30)))
+        return settings
+
+
 @dataclass
 class Settings:
     """Все настройки приложения."""
 
     model: ModelSettings = None
     tts: TTSSettings = None
+    asr: ASRSettings = None
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     history_turns: int = 10
     personas: list[Persona] = None
@@ -98,6 +138,8 @@ class Settings:
             self.model = ModelSettings()
         if self.tts is None:
             self.tts = TTSSettings()
+        if self.asr is None:
+            self.asr = ASRSettings()
         if not self.personas:
             # Конфига нет: характеры встроенные, поэтому сразу берём пресет
             # характера по умолчанию — иначе промпт и голос разъедутся.
@@ -146,6 +188,7 @@ class Settings:
     def from_dict(cls, data: dict) -> "Settings":
         model = ModelSettings.from_dict(data.get("model") or {})
         tts = TTSSettings.from_dict(data.get("tts") or {})
+        asr = ASRSettings.from_dict(data.get("asr") or {})
         personas = _read_personas(data.get("personas"))
         system_prompt = data.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
         active = data.get("active_persona")
@@ -170,6 +213,7 @@ class Settings:
         return cls(
             model=model,
             tts=tts,
+            asr=asr,
             system_prompt=system_prompt,
             history_turns=int(data.get("history_turns") or 10),
             personas=personas,
@@ -204,6 +248,21 @@ class Settings:
                 "silero_sample_rate": self.tts.silero_sample_rate,
                 "silero_accent": self.tts.silero_accent,
                 "silero_yo": self.tts.silero_yo,
+            },
+            "asr": {
+                "mode": self.asr.mode,
+                "engine": self.asr.engine,
+                "model": self.asr.model,
+                "device": self.asr.device,
+                "compute_type": self.asr.compute_type,
+                "language": self.asr.language,
+                "hotkey": self.asr.hotkey,
+                "global_hotkey": self.asr.global_hotkey,
+                "auto_send": self.asr.auto_send,
+                "wake_word": self.asr.wake_word,
+                "input_device": self.asr.input_device,
+                "max_seconds": self.asr.max_seconds,
+                "mute_while_speaking": self.asr.mute_while_speaking,
             },
             "system_prompt": self.system_prompt,
             "history_turns": self.history_turns,

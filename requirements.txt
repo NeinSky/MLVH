@@ -3,3 +3,4 @@ openai>=1.40
 edge-tts>=6.1
 pygame-ce>=2.5
 python-dotenv>=1.0
+numpy>=1.26

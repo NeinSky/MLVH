@@ -144,6 +144,104 @@ def test_example_config() -> None:
     check("нет ключа", "sk-" not in path.read_text(encoding="utf-8"))
 
 
+def test_asr_settings() -> None:
+    print("распознавание: настройки")
+    from app.config import ASRSettings, Settings
+
+    settings = Settings()
+    check("режим по умолчанию — по нажатию", settings.asr.mode == "push", settings.asr.mode)
+    check("движок по умолчанию — whisper", settings.asr.engine == "whisper", settings.asr.engine)
+    check("клавиша по умолчанию", settings.asr.hotkey == "Ctrl+Space", settings.asr.hotkey)
+    check("глобальные клавиши выключены", settings.asr.global_hotkey is False)
+
+    restored = Settings.from_dict(settings.to_dict())
+    check("round-trip сохраняет микрофон",
+          restored.asr.mode == settings.asr.mode
+          and restored.asr.hotkey == settings.asr.hotkey
+          and restored.asr.model == settings.asr.model)
+
+    legacy = Settings.from_dict({"tts": {"voice": "ru-RU-SvetlanaNeural"}})
+    check("старый конфиг без asr", legacy.asr.mode == "push", legacy.asr.mode)
+
+    broken = ASRSettings.from_dict({"mode": "чепуха", "max_seconds": 1})
+    check("неизвестный режим → push", broken.mode == "push", broken.mode)
+    check("предел записи зажат", broken.max_seconds == 3, str(broken.max_seconds))
+
+
+def test_hotkeys() -> None:
+    print("горячие клавиши:")
+    from app.asr.hotkeys import normalize, parse, to_vk
+
+    hotkey = parse("ctrl + space")
+    check("разбор Ctrl+Space", hotkey is not None and hotkey.text() == "Ctrl+Space",
+          hotkey.text() if hotkey else "None")
+
+    mixed = parse("alt+ctrl+space")
+    check("порядок модификаторов", mixed is not None and mixed.text() == "Ctrl+Alt+Space",
+          mixed.text() if mixed else "None")
+
+    check("без модификатора нельзя", parse("space") is None)
+    check("неизвестная клавиша нельзя", parse("Ctrl+НетТакой") is None)
+    check("нормализация", normalize("CTRL+space") == "Ctrl+Space", normalize("CTRL+space"))
+    check("VK пробела", to_vk("Space") == 0x20, str(to_vk("Space")))
+    check("VK буквы", to_vk("A") == 0x41, str(to_vk("A")))
+    check("VK F5", to_vk("F5") == 0x74, str(to_vk("F5")))
+    check("неизвестная клавиша", to_vk("НетТакой") is None)
+
+
+def test_asr_audio() -> None:
+    print("аудио распознавания:")
+    try:
+        import numpy as np
+    except ImportError:
+        print("  numpy нет — пропуск")
+        return
+
+    from app.asr import audio
+
+    rate = 48000
+    tone = np.sin(2 * np.pi * 440 * np.arange(rate // 10) / rate).astype(np.float32)
+    stereo = np.stack([tone, tone], axis=1).reshape(-1)
+    mono = audio.to_mono_16k(stereo, rate, 2)
+    check("48k стерео → 16k моно", abs(len(mono) - 1600) <= 2, str(len(mono)))
+    check("амплитуда сохранилась", 0.9 < audio.peak(mono) <= 1.0, f"{audio.peak(mono):.3f}")
+
+    silence = np.zeros(audio.TARGET_RATE, dtype=np.float32)
+    check("тишина даёт 0", audio.rms(silence) == 0.0, str(audio.rms(silence)))
+    check("level в диапазоне 0..1", 0.0 <= audio.level(0.02) <= 1.0, str(audio.level(0.02)))
+
+    padded = np.concatenate([silence, tone[:1600], silence])
+    trimmed = audio.trim_silence(padded)
+    check("тишина обрезана", 0 < trimmed.size < padded.size,
+          f"{trimmed.size} из {padded.size}")
+
+    path = Path(tempfile.gettempdir()) / "mlvh_selftest.wav"
+    audio.write_wav(path, tone[:1600], audio.TARGET_RATE)
+    read_back, read_rate = audio.read_wav(path)
+    check("wav читается обратно",
+          read_rate == audio.TARGET_RATE and read_back.size == 1600,
+          f"{read_rate} Гц, {read_back.size} отсчётов")
+
+
+def test_asr_registry() -> None:
+    print("движки распознавания:")
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        print("  numpy нет — пропуск")
+        return
+
+    from app.asr.registry import DEFAULT_ASR_ENGINE, asr_engine_infos, get_asr_engine
+
+    infos = asr_engine_infos()
+    ids = [info.id for info in infos]
+    check("есть whisper", "whisper" in ids, str(ids))
+    check("есть vosk", "vosk" in ids, str(ids))
+    check("неизвестный id → whisper", get_asr_engine("nope").id == DEFAULT_ASR_ENGINE)
+    for info in infos:
+        check(f"{info.id}: есть описание", bool(info.title), info.title)
+
+
 def test_version() -> None:
     print("версия:")
     import re
@@ -182,6 +280,10 @@ def main() -> int:
         test_sentence_buffer,
         test_engines,
         test_settings,
+        test_asr_settings,
+        test_hotkeys,
+        test_asr_audio,
+        test_asr_registry,
         test_version,
         test_audio_helpers,
         test_example_config,

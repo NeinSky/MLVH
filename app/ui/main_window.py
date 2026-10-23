@@ -6,9 +6,10 @@ import threading
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QKeySequence, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
+    QKeySequenceEdit,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -31,7 +33,16 @@ from PySide6.QtWidgets import (
 )
 
 from app import __version__
+from app.asr import audio
+from app.asr.global_hotkey import GlobalHotkey
+from app.asr.hotkeys import normalize as normalize_hotkey
+from app.asr.hotkeys import parse as parse_hotkey
+from app.asr.recorder import MicRecorder
+from app.asr.registry import asr_engine_infos, get_asr_engine
+from app.asr.whisper_engine import MODELS as WHISPER_MODELS
 from app.config import (
+    ASR_MODES,
+    ASR_MODE_TITLES,
     AVAILABLE_MODELS,
     BASE_DIR,
     FALLBACK_VOICES,
@@ -52,8 +63,16 @@ from app.personas import (
     persona_by_id,
 )
 from app.tts import SpeechPipeline, TTSService, voice_label
+from app.ui.level_meter import LevelMeter
+from app.ui.mic_dialog import MicDialog
 from app.ui.persona_dialog import PersonaDialog
-from app.ui.workers import ChatWorker, SpeakWorker, SpeechSignals, VoiceListWorker
+from app.ui.workers import (
+    ChatWorker,
+    SpeakWorker,
+    SpeechSignals,
+    TranscribeWorker,
+    VoiceListWorker,
+)
 
 QSS = """
 QMainWindow, QWidget { background: #111827; color: #e5e7eb; }
@@ -92,6 +111,9 @@ QSlider::handle:horizontal {
 }
 QCheckBox { color: #cbd5e1; }
 QStatusBar { color: #9ca3af; }
+QPushButton#Mic { min-width: 32px; padding: 5px 6px; font-size: 16px; }
+QPushButton#Mic[state="recording"] { background: #b91c1c; border-color: #ef4444; }
+QPushButton#Mic[state="busy"] { background: #b45309; border-color: #f59e0b; }
 """
 
 
@@ -114,6 +136,23 @@ class MainWindow(QMainWindow):
         self._voice_worker: VoiceListWorker | None = None
         self._pipeline: SpeechPipeline | None = None
 
+        # --- микрофон и распознавание ---
+        self._recording = False
+        self._transcribe_worker: TranscribeWorker | None = None
+        self._asr_infos: dict = {}
+        self._hotkey_text = normalize_hotkey(self.settings.asr.hotkey)
+
+        self._recorder = MicRecorder(self)
+        self._recorder.level.connect(self._on_mic_level)
+        self._recorder.failed.connect(self._on_mic_failed)
+
+        self._global_hotkey = GlobalHotkey(self)
+        self._global_hotkey.pressed.connect(self._toggle_recording)
+
+        self._max_record_timer = QTimer(self)
+        self._max_record_timer.setSingleShot(True)
+        self._max_record_timer.timeout.connect(self._stop_recording)
+
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(500)
@@ -133,10 +172,15 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._populate_engines()
+        self._populate_asr_engines()
         self._populate_personas()
         self._apply_settings()
         self._refresh_key_state()
         self._load_voices()
+
+        # Хоткей в окне ловим фильтром событий: так работает и удержание.
+        QApplication.instance().installEventFilter(self)
+        self._apply_global_hotkey(announce=False)
 
         # Локальные модели грузятся заранее: Chatterbox ~20 с, Silero ~4 с.
         if self.settings.tts.engine in ("chatterbox", "silero"):
@@ -206,6 +250,13 @@ class MainWindow(QMainWindow):
         self.input.setPlaceholderText("Спросите что-нибудь… (Enter — отправить)")
         self.input.returnPressed.connect(self._send)
 
+        self.mic_button = QPushButton("🎤")
+        self.mic_button.setObjectName("Mic")
+        self.mic_button.setToolTip("Записать голосом")
+        self.mic_button.clicked.connect(self._toggle_recording)
+
+        self.mic_meter = LevelMeter(bars=6)
+
         self.send_button = QPushButton("Отправить")
         self.send_button.setObjectName("Primary")
         self.send_button.clicked.connect(self._send)
@@ -217,6 +268,8 @@ class MainWindow(QMainWindow):
         self.stop_button = QPushButton("Стоп")
         self.stop_button.clicked.connect(self._stop_all)
 
+        row.addWidget(self.mic_button)
+        row.addWidget(self.mic_meter)
         row.addWidget(self.input, 1)
         row.addWidget(self.send_button)
         row.addWidget(self.replay_button)
@@ -363,6 +416,77 @@ class MainWindow(QMainWindow):
         voice_layout.addWidget(self.test_button)
         layout.addWidget(voice_box)
 
+        mic_box = QGroupBox("Микрофон")
+        mic_layout = QVBoxLayout(mic_box)
+
+        self.mic_mode_combo = QComboBox()
+        for mode in ASR_MODES:
+            self.mic_mode_combo.addItem(ASR_MODE_TITLES[mode], mode)
+        self.mic_mode_combo.setToolTip(
+            "Без микрофона — голосовой ввод выключен.\n"
+            "По нажатию — запись только по клавише.\n"
+            "Слушать микрофон — ждать спецслово (микрофон открыт постоянно)."
+        )
+        self.mic_mode_combo.currentIndexChanged.connect(self._on_mic_mode_changed)
+        mic_layout.addWidget(self.mic_mode_combo)
+
+        self.asr_engine_combo = QComboBox()
+        self.asr_engine_combo.setMinimumWidth(200)
+        self.asr_engine_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.asr_engine_combo.setMinimumContentsLength(14)
+        self.asr_engine_combo.currentIndexChanged.connect(self._on_asr_engine_changed)
+        mic_layout.addWidget(self.asr_engine_combo)
+
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Модель:"))
+        self.asr_model_combo = QComboBox()
+        self.asr_model_combo.addItems(WHISPER_MODELS)
+        self.asr_model_combo.currentTextChanged.connect(self._on_asr_model_changed)
+        model_row.addWidget(self.asr_model_combo, 1)
+        mic_layout.addLayout(model_row)
+
+        hotkey_row = QHBoxLayout()
+        hotkey_row.addWidget(QLabel("Клавиша:"))
+        self.hotkey_edit = QKeySequenceEdit()
+        self.hotkey_edit.setMaximumSequenceLength(1)
+        self.hotkey_edit.setToolTip("Нажмите комбинацию с модификатором, например Ctrl+Space")
+        self.hotkey_edit.editingFinished.connect(self._on_hotkey_changed)
+        hotkey_row.addWidget(self.hotkey_edit, 1)
+        mic_layout.addLayout(hotkey_row)
+
+        self.global_hotkey_check = QCheckBox("Регистрировать нажатия глобально")
+        self.global_hotkey_check.setToolTip(
+            "Работает, даже когда окно MLVH не в фокусе.\n"
+            "Глобально Windows отдаёт только нажатие, поэтому запись "
+            "включается и выключается повторным нажатием."
+        )
+        self.global_hotkey_check.toggled.connect(self._on_global_hotkey)
+        mic_layout.addWidget(self.global_hotkey_check)
+
+        self.auto_send_check = QCheckBox("Отправлять сразу после распознавания")
+        self.auto_send_check.toggled.connect(self._on_auto_send)
+        mic_layout.addWidget(self.auto_send_check)
+
+        wake_row = QHBoxLayout()
+        wake_row.addWidget(QLabel("Спецслово:"))
+        self.wake_word_edit = QLineEdit()
+        self.wake_word_edit.setPlaceholderText("элви")
+        self.wake_word_edit.editingFinished.connect(self._on_wake_word)
+        wake_row.addWidget(self.wake_word_edit, 1)
+        mic_layout.addLayout(wake_row)
+
+        self.mic_test_button = QPushButton("Проверить микрофон…")
+        self.mic_test_button.clicked.connect(self._open_mic_test)
+        mic_layout.addWidget(self.mic_test_button)
+
+        self.asr_hint = QLabel("")
+        self.asr_hint.setWordWrap(True)
+        self.asr_hint.setStyleSheet("color:#6b7280;")
+        mic_layout.addWidget(self.asr_hint)
+        layout.addWidget(mic_box)
+
         dialog_box = QGroupBox("Диалог")
         dialog_layout = QVBoxLayout(dialog_box)
         self.thinking_check = QCheckBox("Режим рассуждений")
@@ -459,6 +583,35 @@ class MainWindow(QMainWindow):
             self.engine_combo.setCurrentIndex(engine_index)
             self.engine_combo.blockSignals(False)
         self._refresh_engine_ui()
+
+        asr = self.settings.asr
+        mic_widgets = (
+            self.mic_mode_combo,
+            self.asr_engine_combo,
+            self.asr_model_combo,
+            self.hotkey_edit,
+            self.global_hotkey_check,
+            self.auto_send_check,
+            self.wake_word_edit,
+        )
+        for widget in mic_widgets:
+            widget.blockSignals(True)
+
+        mode_index = self.mic_mode_combo.findData(asr.mode)
+        self.mic_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        asr_index = self.asr_engine_combo.findData(asr.engine)
+        if asr_index >= 0:
+            self.asr_engine_combo.setCurrentIndex(asr_index)
+        if asr.model in WHISPER_MODELS:
+            self.asr_model_combo.setCurrentText(asr.model)
+        self.hotkey_edit.setKeySequence(QKeySequence(asr.hotkey))
+        self.global_hotkey_check.setChecked(bool(asr.global_hotkey))
+        self.auto_send_check.setChecked(bool(asr.auto_send))
+        self.wake_word_edit.setText(asr.wake_word)
+
+        for widget in mic_widgets:
+            widget.blockSignals(False)
+        self._refresh_mic_ui()
 
     def _touch(self) -> None:
         """Настройки меняются часто — пишем файл с небольшой задержкой."""
@@ -674,6 +827,343 @@ class MainWindow(QMainWindow):
         self.voice_combo.setCurrentIndex(index if index >= 0 else 0)
         self.voice_combo.blockSignals(False)
         self.statusBar().showMessage(f"Список голосов не загрузился: {message}", 8000)
+
+    # --- микрофон --------------------------------------------------------
+    def _populate_asr_engines(self) -> None:
+        """Список движков распознавания: недоступные видны, но не выбираются."""
+        self._asr_infos = {info.id: info for info in asr_engine_infos()}
+        self.asr_engine_combo.blockSignals(True)
+        self.asr_engine_combo.clear()
+        for info in self._asr_infos.values():
+            self.asr_engine_combo.addItem(info.label(), info.id)
+        index = self.asr_engine_combo.findData(self.settings.asr.engine)
+        self.asr_engine_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.asr_engine_combo.blockSignals(False)
+
+    def _refresh_mic_ui(self) -> None:
+        """Подсказка, доступность кнопок и индикатора под текущий режим."""
+        asr = self.settings.asr
+        info = self._asr_infos.get(asr.engine)
+        available = bool(info and info.available)
+        enabled = asr.mode != "off"
+
+        self.asr_engine_combo.setEnabled(enabled)
+        self.asr_model_combo.setEnabled(enabled and asr.engine == "whisper")
+        self.hotkey_edit.setEnabled(enabled)
+        self.global_hotkey_check.setEnabled(enabled)
+        self.auto_send_check.setEnabled(enabled)
+        self.wake_word_edit.setEnabled(enabled and asr.mode == "wake")
+        self.mic_test_button.setEnabled(enabled)
+        self.mic_button.setEnabled(enabled)
+
+        if not enabled:
+            self.mic_button.setToolTip("Микрофон выключен: включите режим в панели «Микрофон»")
+        elif not available:
+            self.mic_button.setToolTip("Движок распознавания не установлен: .\\install_asr.ps1")
+        elif asr.mode == "wake":
+            self.mic_button.setToolTip(f"Слушаю спецслово «{asr.wake_word}»")
+        else:
+            self.mic_button.setToolTip(f"Записать голосом ({asr.hotkey})")
+
+        if info is None:
+            self.asr_hint.setText("")
+        elif not info.available:
+            self.asr_hint.setText(f"{info.title}: {info.reason}. {info.hint}")
+        else:
+            self.asr_hint.setText(info.hint.replace("\n", " "))
+
+        if not self._recording and not self._is_running(self._transcribe_worker):
+            self.mic_meter.set_state("ready" if enabled else "idle")
+
+    def _on_mic_mode_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        mode = str(self.mic_mode_combo.itemData(index))
+
+        if mode == "wake":
+            vosk = self._asr_infos.get("vosk")
+            if vosk is None or not vosk.available:
+                QMessageBox.information(
+                    self,
+                    "MLVH",
+                    "Режим «Слушать микрофон» работает на лёгком движке Vosk.\n\n"
+                    "Установите его: .\\install_asr.ps1, затем скачайте модель "
+                    "(см. README). Пока включён режим «По нажатию».",
+                )
+                self.mic_mode_combo.blockSignals(True)
+                back = self.mic_mode_combo.findData(self.settings.asr.mode)
+                self.mic_mode_combo.setCurrentIndex(back if back >= 0 else 0)
+                self.mic_mode_combo.blockSignals(False)
+                return
+
+        self.settings.asr.mode = mode
+        self._touch()
+        self._apply_global_hotkey()
+        self._refresh_mic_ui()
+
+    def _on_asr_engine_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        engine_id = str(self.asr_engine_combo.itemData(index))
+        info = self._asr_infos.get(engine_id)
+
+        if info is not None and not info.available:
+            QMessageBox.information(
+                self,
+                "Движок не установлен",
+                f"{info.title} не установлен.\n\n{info.hint}",
+            )
+            self.asr_engine_combo.blockSignals(True)
+            back = self.asr_engine_combo.findData(self.settings.asr.engine)
+            self.asr_engine_combo.setCurrentIndex(back if back >= 0 else 0)
+            self.asr_engine_combo.blockSignals(False)
+            return
+
+        self.settings.asr.engine = engine_id
+        self._touch()
+        self._refresh_mic_ui()
+
+    def _on_asr_model_changed(self, model: str) -> None:
+        if not model:
+            return
+        self.settings.asr.model = model
+        self._touch()
+
+    def _on_auto_send(self, checked: bool) -> None:
+        self.settings.asr.auto_send = bool(checked)
+        self._touch()
+
+    def _on_wake_word(self) -> None:
+        word = self.wake_word_edit.text().strip().lower() or "элви"
+        self.wake_word_edit.setText(word)
+        self.settings.asr.wake_word = word
+        self._touch()
+        self._refresh_mic_ui()
+
+    def _on_hotkey_changed(self) -> None:
+        text = self.hotkey_edit.keySequence().toString(
+            QKeySequence.SequenceFormat.PortableText
+        )
+        parsed = parse_hotkey(text)
+        if parsed is None:
+            QMessageBox.information(
+                self,
+                "MLVH",
+                "Нужна комбинация с модификатором, например Ctrl+Space.",
+            )
+            self.hotkey_edit.setKeySequence(QKeySequence(self.settings.asr.hotkey))
+            return
+
+        self.settings.asr.hotkey = parsed.text()
+        self._hotkey_text = normalize_hotkey(self.settings.asr.hotkey)
+        self._touch()
+        self._apply_global_hotkey()
+        self._refresh_mic_ui()
+
+    def _on_global_hotkey(self, checked: bool) -> None:
+        self.settings.asr.global_hotkey = bool(checked)
+        self._touch()
+        self._apply_global_hotkey()
+
+    def _apply_global_hotkey(self, announce: bool = True) -> None:
+        """Регистрируем клавишу глобально или честно откатываемся в окно."""
+        self._global_hotkey.unregister()
+        if not self.settings.asr.global_hotkey or self.settings.asr.mode == "off":
+            return
+
+        ok, reason = self._global_hotkey.register(parse_hotkey(self.settings.asr.hotkey))
+        if ok:
+            if announce:
+                self.statusBar().showMessage(
+                    f"Глобальная клавиша: {self.settings.asr.hotkey}", 4000
+                )
+            return
+
+        self.settings.asr.global_hotkey = False
+        self._touch()
+        self.global_hotkey_check.blockSignals(True)
+        self.global_hotkey_check.setChecked(False)
+        self.global_hotkey_check.blockSignals(False)
+        if announce:
+            QMessageBox.warning(
+                self,
+                "MLVH",
+                f"Не удалось зарегистрировать клавишу глобально: {reason}.\n\n"
+                "Она работает, пока окно MLVH активно.",
+            )
+        else:
+            self.statusBar().showMessage(f"Глобальная клавиша недоступна: {reason}", 6000)
+
+    def _open_mic_test(self) -> None:
+        dialog = MicDialog(self.settings, self.tts, self)
+        dialog.exec()
+        self._touch()
+        self._refresh_mic_ui()
+
+    # --- запись и распознавание -----------------------------------------
+    def _set_mic_state(self, state: str) -> None:
+        self.mic_meter.set_state(state)
+        self.mic_button.setProperty("state", state)
+        style = self.mic_button.style()
+        style.unpolish(self.mic_button)
+        style.polish(self.mic_button)
+
+    def _on_mic_level(self, value: float) -> None:
+        if self._recording or self.settings.asr.mode == "wake":
+            self.mic_meter.set_level(value)
+
+    def _on_mic_failed(self, message: str) -> None:
+        self._recording = False
+        self._max_record_timer.stop()
+        self._set_mic_state("idle")
+        self.statusBar().showMessage(message, 8000)
+
+    def _is_speaking(self) -> bool:
+        if self._pipeline is not None and self._pipeline.is_running:
+            return True
+        return self._is_running(self._speak_worker)
+
+    def _mic_problem(self) -> str:
+        asr = self.settings.asr
+        if asr.mode == "off":
+            return "Микрофон выключен: включите режим в панели «Микрофон»"
+        info = self._asr_infos.get(asr.engine)
+        if info is None or not info.available:
+            return "Движок распознавания не установлен: .\\install_asr.ps1"
+        return ""
+
+    def _toggle_recording(self) -> None:
+        """Клик по кнопке и глобальная клавиша: нажал — пишу, нажал — стоп."""
+        if self._recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _start_recording(self) -> None:
+        if self._recording:
+            return
+
+        problem = self._mic_problem()
+        if problem:
+            self.statusBar().showMessage(problem, 6000)
+            return
+
+        if self.settings.asr.mute_while_speaking and self._is_speaking():
+            self.statusBar().showMessage(
+                "MLVH говорит — микрофон не слушаю. Нажмите ещё раз после ответа.", 5000
+            )
+            return
+
+        if not self._recorder.start(self.settings.asr.input_device):
+            return
+
+        self._recorder.begin_capture()
+        self._recording = True
+        self._max_record_timer.start(max(3, int(self.settings.asr.max_seconds)) * 1000)
+        self._set_mic_state("recording")
+        self.statusBar().showMessage(
+            f"Слушаю… ({self.settings.asr.hotkey} — стоп, Esc — отмена)"
+        )
+
+    def _stop_recording(self) -> None:
+        if not self._recording:
+            return
+
+        self._recording = False
+        self._max_record_timer.stop()
+        samples = self._recorder.end_capture()
+        rate = self._recorder.rate
+        self._recorder.stop()
+        self._set_mic_state("idle")
+
+        if samples.size == 0:
+            self.statusBar().showMessage("Ничего не записалось — проверьте микрофон", 5000)
+            return
+
+        seconds = samples.size / float(rate or audio.TARGET_RATE)
+        data = audio.trim_silence(audio.to_mono_16k(samples, rate, 1))
+        if seconds < 0.3 or data.size == 0 or audio.rms(data) < 0.004:
+            self.statusBar().showMessage("Не расслышал — попробуйте ещё раз", 4000)
+            return
+
+        self._transcribe_samples(data)
+
+    def _cancel_recording(self) -> None:
+        if not self._recording:
+            return
+        self._recording = False
+        self._max_record_timer.stop()
+        self._recorder.end_capture()
+        self._recorder.stop()
+        self._set_mic_state("idle")
+        self.statusBar().showMessage("Запись отменена", 3000)
+
+    def _transcribe_samples(self, samples) -> None:
+        if self._is_running(self._transcribe_worker):
+            return
+
+        engine = get_asr_engine(self.settings.asr.engine)
+        worker = TranscribeWorker(engine, samples, self.settings.asr, self)
+        worker.note.connect(lambda text: self.statusBar().showMessage(text))
+        worker.done.connect(self._on_transcribed)
+        worker.failed.connect(self._on_transcribe_failed)
+        worker.finished.connect(self._forget_transcribe_worker)
+        worker.finished.connect(worker.deleteLater)
+        self._transcribe_worker = worker
+
+        self._set_mic_state("busy")
+        self.statusBar().showMessage("Распознаю…")
+        worker.start()
+
+    def _on_transcribed(self, text: str) -> None:
+        self._set_mic_state("idle")
+        text = text.strip()
+        if not text:
+            self.statusBar().showMessage("Не расслышал — попробуйте ещё раз", 4000)
+            return
+
+        if self.input.text() and not self.input.text().endswith(" "):
+            self.input.insert(" ")
+        self.input.insert(text)
+        self.input.setFocus()
+
+        if self.settings.asr.auto_send:
+            self._send()
+        else:
+            self.statusBar().showMessage("Распознано — проверьте и отправьте", 5000)
+
+    def _on_transcribe_failed(self, message: str) -> None:
+        self._set_mic_state("idle")
+        self.statusBar().showMessage(f"Распознавание: {message}", 8000)
+
+    def _forget_transcribe_worker(self) -> None:
+        self._transcribe_worker = None
+
+    def _matches_hotkey(self, event) -> bool:
+        if not self._hotkey_text:
+            return False
+        text = QKeySequence(event.keyCombination()).toString(
+            QKeySequence.SequenceFormat.PortableText
+        )
+        return normalize_hotkey(text) == self._hotkey_text
+
+    def eventFilter(self, obj, event) -> bool:
+        """Хоткей в окне: нажали — пишем, отпустили — распознаём."""
+        if not self.settings.asr.global_hotkey and not self.hotkey_edit.hasFocus():
+            if event.type() == QEvent.Type.KeyPress:
+                if event.key() == Qt.Key.Key_Escape and self._recording:
+                    self._cancel_recording()
+                    return True
+                if self._matches_hotkey(event):
+                    if not event.isAutoRepeat():
+                        self._start_recording()
+                    return True
+            elif event.type() == QEvent.Type.KeyRelease and self._matches_hotkey(event):
+                if not event.isAutoRepeat():
+                    self._stop_recording()
+                return True
+
+        return super().eventFilter(obj, event)
 
     # --- характеры ------------------------------------------------------
     def _populate_personas(self) -> None:
@@ -1113,6 +1603,7 @@ class MainWindow(QMainWindow):
             return False
 
     def _stop_all(self) -> None:
+        self._cancel_recording()
         if self._is_running(self._chat_worker):
             self._chat_worker.cancel()
         self._stop_pipeline()
@@ -1155,8 +1646,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._stop_all()
+        self._recorder.stop()
+        self._global_hotkey.unregister()
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         self._stop_pipeline(wait=True)
         self._stop_thread(self._chat_worker, 3000)
+        self._stop_thread(self._transcribe_worker, 3000)
         self._persist()
         self.tts.stop()
         self._stop_thread(self._speak_worker, 2000)

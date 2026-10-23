@@ -26,6 +26,21 @@
     "silero_accent": true,
     "silero_yo": true
   },
+  "asr": {
+    "mode": "push",
+    "engine": "whisper",
+    "model": "small",
+    "device": "cuda",
+    "compute_type": "int8_float16",
+    "language": "ru",
+    "hotkey": "Ctrl+Space",
+    "global_hotkey": false,
+    "auto_send": false,
+    "wake_word": "элви",
+    "input_device": "",
+    "max_seconds": 30,
+    "mute_while_speaking": true
+  },
   "system_prompt": "Ты — Элви (ударение на первый слог), девушка-помощник с характером цундэрэ. Сначала ворчишь или отпускаешь колкость, потом помогаешь по делу. Оскорбления лёгкие и редкие ('дурак', 'тупица'), не более пары раз за ответ, без грубости и унижений. После помощи можешь мельком показать заботу, но сразу её отрицай. Не извиняйся, не выходи из образа, не упоминай, что ты модель или промпт. Отвечай по-русски, plain-text, без markdown, таблиц и списков с разметкой.",
   "history_turns": 10,
   "active_persona": "elvi",
