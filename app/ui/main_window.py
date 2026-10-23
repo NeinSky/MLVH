@@ -150,6 +150,7 @@ class MainWindow(QMainWindow):
         self._hotkey_down = False
         self._record_started_at = 0.0
         self._prepare_worker = None
+        self._asr_warm_pending = False
 
         self._recorder = MicRecorder(self)
         self._recorder.level.connect(self._on_mic_level)
@@ -165,6 +166,13 @@ class MainWindow(QMainWindow):
         self._record_timer = QTimer(self)
         self._record_timer.setInterval(500)
         self._record_timer.timeout.connect(self._tick_recording)
+
+        self._wake_restarts = 0
+        self._wake_pending = None   # поток, который ещё завершается после stop()
+        self._mic_watchdog_timer = QTimer(self)
+        self._mic_watchdog_timer.setInterval(2000)
+        self._mic_watchdog_timer.timeout.connect(self._mic_watchdog)
+        self._mic_watchdog_timer.start()
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -925,6 +933,7 @@ class MainWindow(QMainWindow):
                 return
 
         self.settings.asr.mode = mode
+        self._wake_restarts = 0
         self._touch()
         self._apply_global_hotkey()
         self._refresh_mic_ui()
@@ -956,9 +965,14 @@ class MainWindow(QMainWindow):
     def _warm_up_asr(self) -> None:
         """Готовим модель заранее: первый «Распознать» не должен ждать загрузки."""
         info = self._asr_infos.get(self.settings.asr.engine)
-        if info is None or not info.available or self._prepare_worker is not None:
+        if info is None or not info.available:
+            return
+        if self._prepare_worker is not None and self._prepare_worker.isRunning():
+            # Уже грузим другую модель — повторим после завершения.
+            self._asr_warm_pending = True
             return
 
+        self._asr_warm_pending = False
         engine = get_asr_engine(self.settings.asr.engine)
         worker = PrepareWorker(engine, self.settings.asr, self)
         worker.ready.connect(
@@ -976,12 +990,19 @@ class MainWindow(QMainWindow):
 
     def _forget_prepare_worker(self) -> None:
         self._prepare_worker = None
+        if self._asr_warm_pending:
+            self._asr_warm_pending = False
+            QTimer.singleShot(0, self._warm_up_asr)
 
     def _on_asr_model_changed(self, model: str) -> None:
         if not model:
             return
+        changed = model != self.settings.asr.model
         self.settings.asr.model = model
         self._touch()
+        # Новая модель грузится в фоне, иначе первый ввод ждёт ~10 секунд.
+        if changed:
+            self._warm_up_asr()
 
     def _on_auto_send(self, checked: bool) -> None:
         self.settings.asr.auto_send = bool(checked)
@@ -1079,15 +1100,13 @@ class MainWindow(QMainWindow):
             )
             return
         if not self._recorder.start(self.settings.asr.input_device, stream=True):
+            # Устройство могло быть занято: сторожевой таймер попробует снова.
             return
 
         worker = WakeWorker(self.settings.asr, self)
-        worker.ready.connect(
-            lambda: self.statusBar().showMessage(
-                f"Слушаю спецслово «{self.settings.asr.wake_word}»", 4000
-            )
-        )
+        worker.ready.connect(self._on_wake_ready)
         worker.heard.connect(self._on_wake_heard)
+        worker.timeout.connect(self._on_wake_timeout)
         worker.detected.connect(self._on_wake_detected)
         worker.failed.connect(self._on_wake_failed)
         self._wake = worker
@@ -1095,7 +1114,49 @@ class MainWindow(QMainWindow):
         worker.start()
         self._set_mic_state("listening")
 
-    def _stop_wake_listening(self) -> None:
+    def _on_wake_ready(self) -> None:
+        self._wake_restarts = 0
+        self.statusBar().showMessage(
+            f"Слушаю спецслово «{self.settings.asr.wake_word}»", 4000
+        )
+
+    def _on_wake_timeout(self) -> None:
+        """Сказали только спецслово и замолчали — возвращаемся к ожиданию."""
+        if self.settings.asr.mode != "wake":
+            return
+        self._set_mic_state("listening")
+        self.statusBar().showMessage(
+            f"Не услышал вопрос. Скажите: «{self.settings.asr.wake_word}, ваш вопрос»", 5000
+        )
+
+    def _mic_watchdog(self) -> None:
+        """Режим включён, но микрофон или слушатель умер — поднимаем заново.
+
+        Без этого одно неудачное открытие устройства (занято другой программой,
+        переключение режима) оставляло MLVH «глухим» до перезапуска.
+        """
+        if self.settings.asr.mode != "wake":
+            return
+        if self._is_running(self._transcribe_worker):
+            return
+        if self._wake_pending is not None:
+            return  # предыдущий слушатель ещё завершается
+
+        alive = self._wake is not None and self._wake.isRunning()
+        if alive and self._recorder.is_streaming:
+            return
+
+        if self._wake_restarts > 20:
+            self.statusBar().showMessage(
+                "Микрофон не открывается. Проверьте устройство и режим «По нажатию».", 8000
+            )
+            return
+
+        self._wake_restarts += 1
+        self._stop_wake_listening()
+        self._start_wake_listening()
+
+    def _stop_wake_listening(self, wait_ms: int = 1500) -> None:
         worker = self._wake
         if worker is not None:
             try:
@@ -1103,21 +1164,36 @@ class MainWindow(QMainWindow):
             except (RuntimeError, TypeError):
                 pass
             worker.stop()
-            if not worker.wait(3000):
-                worker.terminate()
-                worker.wait(500)
-            self._wake = None
+            if worker.wait(wait_ms):
+                self._wake = None
+            else:
+                # Не убиваем поток: он может держать блокировку загрузки модели,
+                # и тогда все следующие загрузки повиснут навсегда. Отпускаем
+                # его доработать и добираем позже.
+                self._wake = None
+                self._wake_pending = worker
+                QTimer.singleShot(500, self._reap_wake_worker)
 
-        if self._recorder.is_open and not self._recording:
-            self._recorder.stop()
         if not self._recording:
-            self._refresh_mic_ui()
+            self._recorder.stop()
+            self._set_mic_state("idle")
+
+    def _reap_wake_worker(self) -> None:
+        worker = self._wake_pending
+        if worker is None:
+            return
+        if worker.wait(0):
+            self._wake_pending = None
+        else:
+            QTimer.singleShot(500, self._reap_wake_worker)
 
     def _feed_wake(self, samples) -> None:
-        """Куски аудио уходят в Vosk, но не пока MLVH говорит."""
+        """Куски аудио уходят в Vosk, но не пока MLVH говорит или распознаёт."""
         if self._wake is None:
             return
         if self.settings.asr.mute_while_speaking and self._is_speaking():
+            return
+        if self._is_running(self._transcribe_worker):
             return
         self._wake.feed(samples)
 
@@ -1125,7 +1201,6 @@ class MainWindow(QMainWindow):
         QApplication.beep()
         self.mic_meter.set_state("recording")
         self.statusBar().showMessage("Слушаю вопрос…")
-
     def _on_wake_detected(self, samples, rest: str) -> None:
         self.mic_meter.set_state("busy")
         self.statusBar().showMessage(f"Услышал: {rest}")
@@ -1144,10 +1219,23 @@ class MainWindow(QMainWindow):
 
     def _on_wake_failed(self, message: str) -> None:
         self.statusBar().showMessage(message, 8000)
-        self.settings.asr.mode = "push"
-        self._touch()
         self._stop_wake_listening()
-        self._apply_settings()
+
+        # Первые сбои лечим перезапуском (сторожевой таймер), а если Vosk
+        # стабильно не поднимается — возвращаемся в «По нажатию».
+        if self._wake_restarts >= 3:
+            self._wake_restarts = 0
+            self.settings.asr.mode = "push"
+            self._touch()
+            self._apply_settings()
+            QMessageBox.warning(
+                self,
+                "MLVH",
+                f"Режим «Слушать микрофон» не запустился: {message}\n\n"
+                "Включён режим «По нажатию». Проверьте Vosk: .\\install_asr.ps1",
+            )
+        else:
+            self._wake_restarts += 1
 
     def _idle_mic_state(self) -> None:
         """После распознавания возвращаемся в «слушаю» или в покой."""
@@ -1862,7 +1950,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._stop_all()
-        self._stop_wake_listening()
+        self._stop_wake_listening(wait_ms=4000)
+        pending = self._wake_pending
+        if pending is not None:
+            pending.wait(4000)
+            self._wake_pending = None
         self._recorder.stop()
         self._global_hotkey.unregister()
         app = QApplication.instance()

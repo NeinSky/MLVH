@@ -3,7 +3,7 @@
 Маленький голосовой помощник: спрашиваете текстом — DeepSeek отвечает, MLVH читает ответ вслух.
 Голос настраивается прямо в окне: тембр, темп, громкость, тон.
 
-Текущая версия — **0.2.3**; что менялось — в [CHANGELOG.md](CHANGELOG.md).
+Текущая версия — **0.2.4**; что менялось — в [CHANGELOG.md](CHANGELOG.md).
 
 [![CI](https://github.com/NeinSky/MLVH/actions/workflows/ci.yml/badge.svg)](https://github.com/NeinSky/MLVH/actions/workflows/ci.yml)
 [![Лицензия: MIT](https://img.shields.io/badge/%D0%BB%D0%B8%D1%86%D0%B5%D0%BD%D0%B7%D0%B8%D1%8F-MIT-green.svg)](LICENSE)

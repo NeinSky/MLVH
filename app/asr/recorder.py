@@ -65,6 +65,14 @@ class MicRecorder(QObject):
         return self._source is not None
 
     @property
+    def is_streaming(self) -> bool:
+        return self._source is not None and self._stream
+
+    def set_stream(self, enabled: bool) -> None:
+        """Включаем или выключаем потоковую отдачу кусков без переоткрытия."""
+        self._stream = bool(enabled)
+
+    @property
     def rate(self) -> int:
         return self._rate
 
@@ -79,6 +87,9 @@ class MicRecorder(QObject):
         иначе копим буфер только между begin_capture() и end_capture().
         """
         if self._source is not None:
+            # Устройство уже открыто: режим потока всё равно должен примениться,
+            # иначе «Слушать микрофон» молчит, хотя микрофон как будто работает.
+            self._stream = stream
             return True
 
         device = self._pick_device(device_name)
@@ -124,6 +135,12 @@ class MicRecorder(QObject):
         if source is not None:
             try:
                 source.stop()
+            except Exception:
+                pass
+            # Qt освобождает устройство не мгновенно; даём ему завершить остановку,
+            # иначе следующий start() может получить None вместо потока.
+            try:
+                source.deleteLater()
             except Exception:
                 pass
 

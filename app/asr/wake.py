@@ -14,13 +14,14 @@ import time
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
-from app.asr import audio
 from app.asr.audio import TARGET_RATE
-from app.asr.vosk_engine import model_path
 from app.asr.wakeword import strip_wake_word
 from app.config import ASRSettings
 
 MAX_PHRASE_SECONDS = 20
+ARM_TIMEOUT = 6.0        # сколько ждём вопрос после одного «Элви»
+SILENCE_SECONDS = 1.0    # текст перестал меняться — фраза закончилась
+QUIET_SEGMENT = 2.5      # текста нет вовсе: всё равно разбираем буфер
 
 
 class WakeWorker(QThread):
@@ -28,6 +29,7 @@ class WakeWorker(QThread):
 
     ready = Signal()
     heard = Signal()                  # спецслово услышано, ждём сам вопрос
+    timeout = Signal()                # ждали вопрос, но так и не дождались
     detected = Signal(object, str)    # (аудио фразы, текст без спецслова)
     failed = Signal(str)
 
@@ -56,10 +58,14 @@ class WakeWorker(QThread):
 
     def run(self) -> None:
         try:
-            from vosk import KaldiRecognizer, Model, SetLogLevel
+            from vosk import KaldiRecognizer, SetLogLevel
+
+            from app.asr.registry import get_asr_engine
 
             SetLogLevel(-1)
-            model = Model(str(model_path()))
+            # Модель берём общую: прогрев уже мог её загрузить, а вторая
+            # параллельная загрузка того же каталога подвешивала Vosk.
+            model = get_asr_engine("vosk").load_model()
             recognizer = KaldiRecognizer(model, TARGET_RATE)
         except Exception as exc:
             self.failed.emit(f"Vosk не готов: {exc}")
@@ -69,9 +75,12 @@ class WakeWorker(QThread):
         buffer: list[np.ndarray] = []
         buffered = 0
         armed = False
-        last_voice = time.monotonic()
         armed_until = 0.0
-        silence = 1.0
+        partial_text = ""
+        # Фразу закрываем по затиханию распознанного текста, а не по громкости:
+        # фоновый шум держал «последний голос» свежим, и фраза не закрывалась.
+        last_change = time.monotonic()
+        segment_start = last_change
 
         while not self._stop.is_set():
             try:
@@ -81,12 +90,12 @@ class WakeWorker(QThread):
 
             now = time.monotonic()
             if chunk is not None:
+                if not buffer:
+                    segment_start = now
                 buffer.append(chunk)
                 buffered += len(chunk)
                 while buffered > MAX_PHRASE_SECONDS * TARGET_RATE and buffer:
                     buffered -= len(buffer.pop(0))
-                if audio.rms(chunk) > 0.008:
-                    last_voice = now
 
                 pcm = (np.clip(chunk, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
                 try:
@@ -97,6 +106,8 @@ class WakeWorker(QThread):
 
                 if final:
                     text = str(json.loads(recognizer.Result()).get("text", "")).strip()
+                    partial_text = ""
+                    last_change = now
                     rest = strip_wake_word(text, self._word)
                     if rest is None and armed:
                         # Vosk мог проглотить имя — фраза всё равно наша.
@@ -111,23 +122,32 @@ class WakeWorker(QThread):
                         buffer, buffered = [], 0
                         if not armed:
                             armed = True
-                            armed_until = now + 6.0
+                            armed_until = now + ARM_TIMEOUT
                             self.heard.emit()
                         continue
-                elif not armed:
+                else:
                     partial = str(
                         json.loads(recognizer.PartialResult()).get("partial", "")
                     )
-                    if strip_wake_word(partial, self._word) is not None:
+                    if partial != partial_text:
+                        partial_text = partial
+                        last_change = now
+                    if not armed and strip_wake_word(partial, self._word) is not None:
                         armed = True
-                        armed_until = now + 6.0
+                        armed_until = now + ARM_TIMEOUT
                         self.heard.emit()
 
-            # Долгая тишина закрывает сегмент: проверяем, было ли спецслово.
-            if now - last_voice > silence and buffered:
+            # Фраза закончилась: текст стабилен (или его нет вовсе, но буфер
+            # уже набрался). Разбираем накопленное и начинаем заново.
+            quiet = now - last_change > SILENCE_SECONDS and bool(partial_text)
+            empty = now - segment_start > QUIET_SEGMENT and not partial_text
+            if buffered and (quiet or empty):
                 text = str(json.loads(recognizer.FinalResult()).get("text", "")).strip()
                 phrase = self._take(buffer)
                 buffer, buffered = [], 0
+                partial_text = ""
+                last_change = now
+                segment_start = now
                 recognizer = KaldiRecognizer(model, TARGET_RATE)
 
                 was_armed = armed
@@ -142,14 +162,23 @@ class WakeWorker(QThread):
                 elif rest == "" and not was_armed:
                     # Сказали только «Элви» — ждём вопрос отдельной фразой.
                     armed = True
-                    armed_until = now + 6.0
+                    armed_until = now + ARM_TIMEOUT
                     self.heard.emit()
+                elif was_armed:
+                    # Пустой сегмент во время ожидания вопроса: не сбрасываем
+                    # сразу, даём договорить. Таймаут решит armed_until.
+                    armed = True
                 continue
 
             if armed and now > armed_until:
+                # Ждали вопрос и не дождались: сообщаем интерфейсу, иначе
+                # индикатор навсегда остаётся в состоянии «слушаю вопрос».
                 armed = False
                 buffer, buffered = [], 0
+                partial_text = ""
+                last_change = now
                 recognizer = KaldiRecognizer(model, TARGET_RATE)
+                self.timeout.emit()
 
     @staticmethod
     def _take(buffer: list[np.ndarray]) -> np.ndarray:

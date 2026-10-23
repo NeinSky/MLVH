@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +47,7 @@ class WhisperEngine(ASREngine):
     def __init__(self) -> None:
         self._model = None
         self._key: tuple[str, str, str] | None = None
+        self._lock = threading.Lock()
         self.device_name = ""
 
     def probe(self) -> ASRInfo:
@@ -80,6 +82,14 @@ class WhisperEngine(ASREngine):
         if self._model is not None and self._key == key:
             return self._model
 
+        # Прогрев и распознавание идут в разных потоках. Две одновременные
+        # загрузки CTranslate2 вешали приложение при смене модели.
+        with self._lock:
+            if self._model is not None and self._key == key:
+                return self._model
+            return self._load_locked(settings, key)
+
+    def _load_locked(self, settings: ASRSettings, key: tuple[str, str, str]):
         _add_torch_dlls()
         try:
             from faster_whisper import WhisperModel
