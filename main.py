@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from app import __version__
 from app.config import Settings, get_api_key, load_settings
 from app.personas import persona_by_id
 
@@ -19,6 +20,12 @@ def _fix_console() -> None:
 def main() -> int:
     _fix_console()
     parser = argparse.ArgumentParser(description="MLVH — My Little Voice Helper")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"MLVH {__version__}",
+        help="показать версию и выйти",
+    )
     parser.add_argument(
         "--list-voices",
         nargs="?",
@@ -110,6 +117,7 @@ def _run_gui(settings: Settings) -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("MLVH")
+    app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
 
     window = MainWindow(settings)

@@ -144,6 +144,36 @@ def test_example_config() -> None:
     check("нет ключа", "sk-" not in path.read_text(encoding="utf-8"))
 
 
+def test_version() -> None:
+    print("версия:")
+    import re
+
+    from app import __version__
+
+    check("формат X.Y.Z", bool(re.fullmatch(r"\d+\.\d+\.\d+", __version__)), __version__)
+
+    path = BASE_DIR / "CHANGELOG.md"
+    check("CHANGELOG.md есть", path.exists(), str(path))
+    if not path.exists():
+        return
+
+    text = path.read_text(encoding="utf-8")
+    versions = re.findall(r"^##\s+(\d+\.\d+\.\d+)", text, flags=re.MULTILINE)
+    check("в changelog есть версии", bool(versions), str(versions))
+    if not versions:
+        return
+
+    check("верхняя запись — текущая версия", versions[0] == __version__,
+          f"{versions[0]} != {__version__}")
+    check("версии не повторяются", len(versions) == len(set(versions)), str(versions))
+    check("новые версии сверху",
+          versions == sorted(versions, key=_version_key, reverse=True), str(versions))
+
+
+def _version_key(value: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in value.split("."))
+
+
 def main() -> int:
     print(f"Python {sys.version.split()[0]} | {BASE_DIR}")
     print("")
@@ -152,6 +182,7 @@ def main() -> int:
         test_sentence_buffer,
         test_engines,
         test_settings,
+        test_version,
         test_audio_helpers,
         test_example_config,
     ):

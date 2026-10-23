@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app import __version__
 from app.config import (
     AVAILABLE_MODELS,
     BASE_DIR,
@@ -126,7 +127,7 @@ class MainWindow(QMainWindow):
         self._speech_signals.prepare_done.connect(self._on_prepare_done)
         self._speech_signals.prepare_failed.connect(self._on_prepare_failed)
 
-        self.setWindowTitle("MLVH — My Little Voice Helper")
+        self.setWindowTitle(f"MLVH {__version__} — My Little Voice Helper")
         self.resize(1040, 700)
         self.setStyleSheet(QSS)
 
