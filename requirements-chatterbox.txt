@@ -1,0 +1,13 @@
+# Опциональный локальный движок Chatterbox (MIT).
+# MLVH работает и без него — на Edge TTS. Ставится отдельно:
+#   .\install_chatterbox.ps1
+#
+# ВАЖНО: torch с PyPI — это CPU-сборка. Для GPU ставьте его отдельно:
+#   pip install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
+torchaudio==2.6.0
+transformers==5.2.0
+chatterbox-tts==0.1.7
+# perth (водяной знак) требует pkg_resources и onnxruntime
+setuptools<81
+onnxruntime
