@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 from app.personas import (
     DEFAULT_PERSONA_ID,
+    ELVI_PROMPT,
     Persona,
     builtin_personas,
     persona_by_id,
@@ -26,11 +27,8 @@ AVAILABLE_MODELS = ("deepseek-flash", "deepseek-v4-pro")
 DEFAULT_VOICE = "ru-RU-DmitryNeural"
 FALLBACK_VOICES = ("ru-RU-DmitryNeural", "ru-RU-SvetlanaNeural")
 
-DEFAULT_SYSTEM_PROMPT = (
-    "Ты голосовой помощник MLVH (My Little Voice Helper). "
-    "Отвечай по-русски, коротко и по делу: твой ответ прочитают вслух. "
-    "Не используй markdown, таблицы, ссылки и списки, если об этом не просят."
-)
+# Конфига ещё нет — работаем от характера по умолчанию (Элви).
+DEFAULT_SYSTEM_PROMPT = ELVI_PROMPT
 
 
 def _known_values(cls: type, data: dict) -> dict:
@@ -101,7 +99,12 @@ class Settings:
         if self.tts is None:
             self.tts = TTSSettings()
         if not self.personas:
+            # Конфига нет: характеры встроенные, поэтому сразу берём пресет
+            # характера по умолчанию — иначе промпт и голос разъедутся.
             self.personas = builtin_personas()
+            default = persona_by_id(self.personas, self.active_persona)
+            if default is not None:
+                self.apply_persona(default)
 
     def persona(self) -> Persona | None:
         """Активный характер (или None, если id не найден)."""

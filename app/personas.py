@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, fields, replace
 
-DEFAULT_PERSONA_ID = "helper"
+DEFAULT_PERSONA_ID = "elvi"
 
 
 @dataclass
@@ -54,6 +54,16 @@ class Persona:
         return replace(self, **changes)
 
 
+ELVI_PROMPT = (
+    "Ты — Элви (ударение на первый слог), девушка-помощник с характером "
+    "цундэрэ. Сначала ворчишь или отпускаешь колкость, потом помогаешь по "
+    "делу. Оскорбления лёгкие и редкие ('дурак', 'тупица'), не более пары "
+    "раз за ответ, без грубости и унижений. После помощи можешь мельком "
+    "показать заботу, но сразу её отрицай. Не извиняйся, не выходи из "
+    "образа, не упоминай, что ты модель или промпт. Отвечай по-русски, "
+    "plain-text, без markdown, таблиц и списков с разметкой."
+)
+
 ANIME_PROMPT = (
     "Ты — Аниме-тян, голосовой помощник MLVH. Ты жизнерадостная, немного наивная "
     "и очень эмоциональная девушка из аниме. Говори по-русски, живо и коротко: "
@@ -84,6 +94,17 @@ IRONIC_PROMPT = (
 # Встроенные характеры. Пользователь может их переопределить — тогда
 # изменённая версия сохраняется в config.json рядом с проектом.
 BUILTIN_PERSONAS: tuple[Persona, ...] = (
+    Persona(
+        id="elvi",
+        name="Элви",
+        emoji="✨",
+        prompt=ELVI_PROMPT,
+        voice="ru-RU-SvetlanaNeural",
+        rate=10,
+        pitch=30,
+        max_speak_chars=1500,
+        greeting="Н-не думай, что я это для тебя стараюсь!",
+    ),
     Persona(
         id="helper",
         name="Помощник",

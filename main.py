@@ -33,7 +33,7 @@ def main() -> int:
     parser.add_argument(
         "--persona",
         metavar="ID",
-        help="характер: helper, anime, mentor, ironic (или свой из config.json)",
+        help="характер: elvi (по умолчанию), helper, anime, mentor, ironic или свой из config.json",
     )
     parser.add_argument("--list-personas", action="store_true", help="показать характеры и выйти")
     args = parser.parse_args()

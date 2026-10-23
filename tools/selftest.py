@@ -79,12 +79,28 @@ def test_engines() -> None:
 def test_settings() -> None:
     print("настройки:")
     from app.config import Settings
-    from app.personas import DEFAULT_PERSONA_ID, builtin_personas
+    from app.personas import (
+        DEFAULT_PERSONA_ID,
+        builtin_personas,
+        is_builtin_persona,
+    )
 
     settings = Settings()
     check("движок по умолчанию", settings.tts.engine == "edge", settings.tts.engine)
     check("характеры на месте", len(settings.personas) == len(builtin_personas()))
     check("активный характер", settings.active_persona == DEFAULT_PERSONA_ID)
+
+    default_persona = settings.persona()
+    check("id по умолчанию встроенный", is_builtin_persona(DEFAULT_PERSONA_ID),
+          DEFAULT_PERSONA_ID)
+    check("характер по умолчанию — Элви",
+          default_persona is not None and default_persona.name == "Элви",
+          default_persona.name if default_persona else "нет")
+    check("пресет по умолчанию применён",
+          default_persona is not None
+          and settings.tts.voice == default_persona.voice
+          and settings.tts.rate == default_persona.rate,
+          settings.tts.voice)
 
     data = settings.to_dict()
     check("сериализуется в JSON", isinstance(json.dumps(data), str))
@@ -122,6 +138,9 @@ def test_example_config() -> None:
     data = json.loads(path.read_text(encoding="utf-8"))
     check("есть tts", "tts" in data)
     check("есть характеры", bool(data.get("personas")))
+    ids = [item.get("id") for item in data.get("personas") or [] if isinstance(item, dict)]
+    check("активный характер есть в списке", data.get("active_persona") in ids,
+          str(data.get("active_persona")))
     check("нет ключа", "sk-" not in path.read_text(encoding="utf-8"))
 
 
