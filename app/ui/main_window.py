@@ -584,10 +584,12 @@ class MainWindow(QMainWindow):
         rounds_row = QHBoxLayout()
         rounds_row.addWidget(QLabel("Шагов:"))
         self.agent_rounds_spin = QSpinBox()
-        self.agent_rounds_spin.setRange(1, 12)
+        self.agent_rounds_spin.setRange(1, 2_147_483_647)
         self.agent_rounds_spin.setToolTip(
             "Сколько раз агент может обратиться к файлам за один вопрос.\n"
-            "Повторные одинаковые вызовы, время и объём данных ограничены отдельно."
+            "По умолчанию 20; можно задать любое положительное число.\n"
+            "Повторные вызовы, 300 с и 800 000 символов ограничены отдельно —\n"
+            "при большом числе шагов их можно поднять в config.json."
         )
         self.agent_rounds_spin.valueChanged.connect(self._on_agent_rounds)
         rounds_row.addWidget(self.agent_rounds_spin)

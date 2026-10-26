@@ -74,7 +74,7 @@ def main() -> int:
         "--agent-rounds",
         type=int,
         metavar="N",
-        help="предел шагов агента для --ask (1–12)",
+        help="предел шагов агента для --ask (по умолчанию 20)",
     )
     args = parser.parse_args()
 
@@ -263,7 +263,7 @@ def _ask(text: str, settings: Settings, args) -> int:
 
     limits = AgentLimits.from_settings(settings.agent)
     if args.agent_rounds:
-        limits = replace(limits, max_rounds=max(1, min(12, args.agent_rounds)))
+        limits = replace(limits, max_rounds=max(1, args.agent_rounds))
 
     roots = list(args.read_folder or [])
     if not roots and settings.agent.read_enabled:

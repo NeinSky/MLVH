@@ -66,25 +66,25 @@ class ToolError(RuntimeError):
 class AgentLimits:
     """Снимок лимитов агента: настройки могут поменяться, запрос — нет."""
 
-    max_rounds: int = 6
+    max_rounds: int = 20
     duplicate_limit: int = 2
-    max_tool_calls: int = 12
-    max_seconds: float = 120.0
+    max_tool_calls: int = 100
+    max_seconds: float = 300.0
     max_file_bytes: int = 262_144
     max_read_lines: int = 400
-    max_tool_chars: int = 400_000
+    max_tool_chars: int = 800_000
 
     @classmethod
     def from_settings(cls, settings: object) -> "AgentLimits":
         """Строим из AgentSettings, не импортируя config (чтобы не было цикла)."""
         return cls(
-            max_rounds=int(getattr(settings, "max_rounds", 6)),
+            max_rounds=int(getattr(settings, "max_rounds", 20)),
             duplicate_limit=int(getattr(settings, "duplicate_limit", 2)),
-            max_tool_calls=int(getattr(settings, "max_tool_calls", 12)),
-            max_seconds=float(getattr(settings, "max_seconds", 120)),
+            max_tool_calls=int(getattr(settings, "max_tool_calls", 100)),
+            max_seconds=float(getattr(settings, "max_seconds", 300)),
             max_file_bytes=int(getattr(settings, "max_file_bytes", 262_144)),
             max_read_lines=int(getattr(settings, "max_read_lines", 400)),
-            max_tool_chars=int(getattr(settings, "max_tool_chars", 400_000)),
+            max_tool_chars=int(getattr(settings, "max_tool_chars", 800_000)),
         )
 
 

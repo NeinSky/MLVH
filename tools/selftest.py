@@ -110,6 +110,15 @@ def test_settings() -> None:
           str(settings.model.context_tokens))
     check("агент выключен по умолчанию", settings.agent.read_enabled is False)
     check("рабочих папок нет", settings.agent.roots == [], str(settings.agent.roots))
+    check("шагов по умолчанию — 20", settings.agent.max_rounds == 20,
+          str(settings.agent.max_rounds))
+    check("вызовов по умолчанию — 100", settings.agent.max_tool_calls == 100,
+          str(settings.agent.max_tool_calls))
+    check("время по умолчанию — 300 с", settings.agent.max_seconds == 300,
+          str(settings.agent.max_seconds))
+    check("объём данных по умолчанию — 800k",
+          settings.agent.max_tool_chars == 800_000,
+          str(settings.agent.max_tool_chars))
     check("history_turns больше не пишется", "history_turns" not in data)
 
     restored = Settings.from_dict(data)
@@ -123,8 +132,12 @@ def test_settings() -> None:
     broken = Settings.from_dict(
         {"agent": {"max_rounds": 99, "max_seconds": 1, "roots": "D:\\x"}}
     )
-    check("лимит шагов зажат", broken.agent.max_rounds == 12,
+    check("верхний предел шагов не зажимается", broken.agent.max_rounds == 99,
           str(broken.agent.max_rounds))
+    check("произвольное число шагов сохраняется",
+          Settings.from_dict({"agent": {"max_rounds": 1000}}).agent.max_rounds == 1000)
+    check("произвольное число вызовов сохраняется",
+          Settings.from_dict({"agent": {"max_tool_calls": 500}}).agent.max_tool_calls == 500)
     check("предел времени зажат", broken.agent.max_seconds == 10,
           str(broken.agent.max_seconds))
     check("кривые roots игнорируются", broken.agent.roots == [],
@@ -138,9 +151,36 @@ def test_settings() -> None:
     )
     check("битое окно → 1M", broken_text.model.context_tokens == 1_000_000,
           str(broken_text.model.context_tokens))
-    check("битый лимит → 6", broken_text.agent.max_rounds == 6,
+    check("битый лимит → 20", broken_text.agent.max_rounds == 20,
           str(broken_text.agent.max_rounds))
     check("строка true → включено", broken_text.agent.read_enabled is True)
+
+    migrated = Settings.from_dict(
+        {
+            "agent": {
+                "max_rounds": 12,
+                "max_tool_calls": 12,
+                "max_seconds": 120,
+                "max_tool_chars": 400_000,
+            }
+        }
+    )
+    check("старые лимиты 0.3.0 подняты",
+          migrated.agent.max_rounds == 20
+          and migrated.agent.max_tool_calls == 100
+          and migrated.agent.max_seconds == 300
+          and migrated.agent.max_tool_chars == 800_000,
+          str(migrated.agent))
+    check("версия лимитов записана", migrated.agent.limits_version == 2,
+          str(migrated.agent.limits_version))
+
+    explicit = Settings.from_dict(
+        {"agent": {"limits_version": 2, "max_rounds": 12, "max_tool_calls": 12}}
+    )
+    check("при limits_version=2 явные 12 не трогаем",
+          explicit.agent.max_rounds == 12
+          and explicit.agent.max_tool_calls == 12,
+          str(explicit.agent))
 
     # Старый конфиг без характеров превращается в «Мой голос».
     legacy = Settings.from_dict({"tts": {"voice": "ru-RU-SvetlanaNeural", "rate": 7}})
@@ -175,6 +215,13 @@ def test_example_config() -> None:
     check("окно модели 1M",
           (data.get("model") or {}).get("context_tokens") == 1_000_000,
           str((data.get("model") or {}).get("context_tokens")))
+    agent = data.get("agent") or {}
+    check("шагов в примере — 20", agent.get("max_rounds") == 20,
+          str(agent.get("max_rounds")))
+    check("вызовов в примере — 100", agent.get("max_tool_calls") == 100,
+          str(agent.get("max_tool_calls")))
+    check("версия лимитов в примере", agent.get("limits_version") == 2,
+          str(agent.get("limits_version")))
     check("history_turns убран", "history_turns" not in data)
     ids = [item.get("id") for item in data.get("personas") or [] if isinstance(item, dict)]
     check("активный характер есть в списке", data.get("active_persona") in ids,

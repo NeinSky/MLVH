@@ -143,16 +143,18 @@ class AgentSettings:
 
     read_enabled: bool = False          # право «Чтение»: галочка в разделе «Агент»
     roots: list[str] = field(default_factory=list)   # рабочие папки (абсолютные пути)
-    max_rounds: int = 6                 # шагов с инструментами на один вопрос
+    limits_version: int = 2             # версия миграции лимитов (см. from_dict)
+    max_rounds: int = 20                # шагов с инструментами на один вопрос
     duplicate_limit: int = 2            # сколько раз можно повторить один и тот же вызов
-    max_tool_calls: int = 12            # всего вызовов инструментов на один вопрос
-    max_seconds: int = 120              # предел времени на весь агентский цикл
+    max_tool_calls: int = 100           # всего вызовов инструментов на один вопрос
+    max_seconds: int = 300              # предел времени на весь агентский цикл
     max_file_bytes: int = 262_144       # сколько текста вернуть за одно чтение (256 КБ)
     max_read_lines: int = 400           # строк за одно чтение
-    max_tool_chars: int = 400_000       # суммарный объём результатов инструментов
+    max_tool_chars: int = 800_000       # суммарный объём результатов инструментов
 
     @classmethod
     def from_dict(cls, data: dict) -> "AgentSettings":
+        raw_version = _clamp_int(data.get("limits_version"), 1, 1, 999)
         settings = cls(**_known_values(cls, data))
         raw_enabled = settings.read_enabled
         if isinstance(raw_enabled, str):
@@ -174,17 +176,34 @@ class AgentSettings:
                     roots.append(text)
         settings.roots = roots
 
-        settings.max_rounds = _clamp_int(settings.max_rounds, 6, 1, 12)
+        settings.max_rounds = _clamp_int(
+            settings.max_rounds, 20, 1, 2_147_483_647
+        )
         settings.duplicate_limit = _clamp_int(settings.duplicate_limit, 2, 1, 5)
-        settings.max_tool_calls = _clamp_int(settings.max_tool_calls, 12, 1, 40)
-        settings.max_seconds = _clamp_int(settings.max_seconds, 120, 10, 600)
+        settings.max_tool_calls = _clamp_int(
+            settings.max_tool_calls, 100, 1, 2_147_483_647
+        )
+        settings.max_seconds = _clamp_int(settings.max_seconds, 300, 10, 86_400)
         settings.max_file_bytes = _clamp_int(
             settings.max_file_bytes, 262_144, 4096, 4_000_000
         )
         settings.max_read_lines = _clamp_int(settings.max_read_lines, 400, 50, 2000)
         settings.max_tool_chars = _clamp_int(
-            settings.max_tool_chars, 400_000, 10_000, 2_000_000
+            settings.max_tool_chars, 800_000, 10_000, 4_000_000
         )
+
+        if raw_version < 2:
+            # В 0.3.0 шаги по умолчанию были 6, спинбокс — до 12, вызовов — 12.
+            # Для нормального обхода каталогов поднимаем старые значения один раз.
+            if settings.max_rounds in (6, 12):
+                settings.max_rounds = 20
+            if settings.max_tool_calls == 12:
+                settings.max_tool_calls = 100
+            if settings.max_seconds == 120:
+                settings.max_seconds = 300
+            if settings.max_tool_chars == 400_000:
+                settings.max_tool_chars = 800_000
+            settings.limits_version = 2
         return settings
 
 
@@ -338,6 +357,7 @@ class Settings:
             "agent": {
                 "read_enabled": self.agent.read_enabled,
                 "roots": list(self.agent.roots),
+                "limits_version": self.agent.limits_version,
                 "max_rounds": self.agent.max_rounds,
                 "duplicate_limit": self.agent.duplicate_limit,
                 "max_tool_calls": self.agent.max_tool_calls,
