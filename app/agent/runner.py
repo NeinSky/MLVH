@@ -13,10 +13,12 @@ from app.agent.policy import AgentLimits, Workspace
 from app.agent.tools import TOOL_SCHEMAS, call_tool
 from app.deepseek_client import DeepSeekClient, DeepSeekError, ToolCall
 
-STOP_TEXT = (
-    "Агент остановился: исчерпан лимит шагов или объёма данных. "
-    "Уточните вопрос или уменьшите объём чтения."
-)
+def _stop_text(human: str, detail: str) -> str:
+    """Понятная причина остановки: не просто «лимит», а какой и сколько."""
+    return (
+        f"Агент остановился: лимит {human} ({detail}). "
+        "Уточните вопрос или уменьшите объём чтения."
+    )
 
 
 @dataclass
@@ -89,17 +91,21 @@ class AgentRunner:
         calls: int,
         tool_chars: int,
         no_progress: int,
-    ) -> tuple[str, str]:
-        """(код, человеческая причина) или ("", "")."""
+    ) -> tuple[str, str, str]:
+        """(код, человеческая причина, подробности) или ("", "", "")."""
         if no_progress >= 2:
-            return "stuck", "отсутствия прогресса"
+            return "stuck", "нет прогресса", "два раунда подряд без успешных вызовов"
         if rounds >= self._limits.max_rounds:
-            return "rounds", "шагов"
+            return "rounds", "шагов", f"{rounds} из {self._limits.max_rounds}"
         if calls >= self._limits.max_tool_calls:
-            return "calls", "вызовов"
+            return "calls", "вызовов", f"{calls} из {self._limits.max_tool_calls}"
         if tool_chars >= self._limits.max_tool_chars:
-            return "data", "объёма данных"
-        return "", ""
+            return (
+                "data",
+                "объёма данных",
+                f"{tool_chars} из {self._limits.max_tool_chars} символов",
+            )
+        return "", "", ""
 
     def _final_messages(self) -> list[dict]:
         """Тот же диалог, но с требованием ответить без новых инструментов."""
@@ -167,29 +173,48 @@ class AgentRunner:
         while True:
             if self._cancel.is_set():
                 return None
-            if self._clock() - started > self._limits.max_seconds:
-                self._note("Лимит времени исчерпан — останавливаюсь.")
+            elapsed = self._clock() - started
+            if elapsed > self._limits.max_seconds:
+                reason = _stop_text(
+                    "времени",
+                    f"{elapsed:.0f} из {self._limits.max_seconds:.0f} с",
+                )
+                self._note(f"Лимит времени ({elapsed:.0f} с): останавливаюсь.")
                 return self._finish(
-                    self._partial_text() or STOP_TEXT, usage, rounds, calls, "time"
+                    self._partial_text() or reason, usage, rounds, calls, "time"
                 )
 
-            code, human = self._limit_reason(rounds, calls, tool_chars, no_progress)
+            code, human, detail = self._limit_reason(
+                rounds, calls, tool_chars, no_progress
+            )
             if code:
                 if forced:
                     return self._finish(
-                        self._partial_text() or STOP_TEXT, usage, rounds, calls, code
+                        self._partial_text() or _stop_text(human, detail),
+                        usage,
+                        rounds,
+                        calls,
+                        code,
                     )
                 forced = True
-                self._note(f"Лимит {human}: отвечаю по уже прочитанному.")
+                self._note(f"Лимит {human} ({detail}): отвечаю по уже прочитанному.")
                 try:
                     final = self._request(self._final_messages(), None)
                 except DeepSeekError:
                     return self._finish(
-                        self._partial_text() or STOP_TEXT, usage, rounds, calls, code
+                        self._partial_text() or _stop_text(human, detail),
+                        usage,
+                        rounds,
+                        calls,
+                        code,
                     )
                 rounds += 1
                 self._add_usage(usage, final.usage)
-                text = final.text.strip() or self._partial_text() or STOP_TEXT
+                text = (
+                    final.text.strip()
+                    or self._partial_text()
+                    or _stop_text(human, detail)
+                )
                 return self._finish(text, usage, rounds, calls, code)
 
             try:
@@ -235,7 +260,8 @@ class AgentRunner:
                 if not result.tool_calls:
                     if not text:
                         return self._finish(
-                            self._partial_text() or STOP_TEXT,
+                            self._partial_text()
+                            or _stop_text("ответа", "модель вернула пустой ответ"),
                             usage,
                             rounds,
                             calls,

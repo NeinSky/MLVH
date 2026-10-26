@@ -436,14 +436,24 @@ def test_agent_tools() -> None:
     from app.agent.tools import TOOL_SCHEMAS, call_tool
 
     names = [item["function"]["name"] for item in TOOL_SCHEMAS]
-    check("три инструмента",
-          names == ["list_dir", "read_file", "search_text"], str(names))
+    check("четыре инструмента",
+          names == ["list_dir", "read_file", "search_text", "count_lines"],
+          str(names))
     check("у всех есть описание",
           all(item["function"].get("description") for item in TOOL_SCHEMAS))
 
     with tempfile.TemporaryDirectory(prefix="mlvh_tools_") as tmp:
         root = Path(tmp)
         (root / "a.txt").write_text("Привет, мир\n", encoding="utf-8")
+        (root / "a.py").write_text("1\n2\n3\n", encoding="utf-8")
+        (root / "b.toml").write_text("x = 1\ny = 2\n", encoding="utf-8")
+        (root / "c.txt").write_text("не считаем\n", encoding="utf-8")
+        sub = root / "sub"
+        sub.mkdir()
+        (sub / "d.py").write_text("1\n2\n3\n4\n", encoding="utf-8")
+        venv = root / ".venv"
+        venv.mkdir()
+        (venv / "skip.py").write_text("\n".join(["x"] * 100), encoding="utf-8")
         workspace = Workspace([root], AgentLimits())
 
         result = call_tool("read_file", '{"path": "a.txt"}', workspace)
@@ -465,6 +475,32 @@ def test_agent_tools() -> None:
         query = call_tool("search_text", json.dumps({"query": "мир"}), workspace)
         check("search_text через диспетчер",
               query.ok and "a.txt" in query.content, query.content)
+
+        counted = call_tool(
+            "count_lines",
+            json.dumps({"extensions": [".py", ".toml"]}),
+            workspace,
+        )
+        check("count_lines считает .py и .toml",
+              counted.ok
+              and "файлов 3" in counted.content
+              and "строк 9" in counted.content
+              and "файлов 2" in counted.content
+              and "строк 7" in counted.content
+              and "строк 2" in counted.content,
+              counted.content)
+        check("count_lines пропускает .venv",
+              "строк 109" not in counted.content, counted.content)
+
+        counted_py = call_tool(
+            "count_lines", json.dumps({"extensions": [".py"]}), workspace
+        )
+        check("count_lines только .py",
+              counted_py.ok and "строк 7" in counted_py.content,
+              counted_py.content)
+
+        bad_ext = call_tool("count_lines", "{}", workspace)
+        check("count_lines требует расширения", not bad_ext.ok, bad_ext.content)
 
 
 def test_agent_context() -> None:

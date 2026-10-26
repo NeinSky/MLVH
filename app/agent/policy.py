@@ -533,3 +533,109 @@ class Workspace:
         if not matches:
             header.append("Ничего не найдено.")
         return "\n".join(header + matches)
+
+    def count_lines(
+        self,
+        raw_path: object = ".",
+        extensions: object = None,
+        max_files: int = 2000,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> str:
+        """Считаем строки в файлах с нужными расширениями, не отдавая их содержимое."""
+        if isinstance(extensions, str):
+            extensions = [
+                part for part in extensions.replace(",", " ").split() if part
+            ]
+        if not isinstance(extensions, (list, tuple)):
+            raise ToolError(
+                "extensions должен быть списком, например [\".py\", \".toml\"]"
+            )
+
+        exts: list[str] = []
+        for item in extensions:
+            if not isinstance(item, str):
+                continue
+            value = item.strip().casefold()
+            if not value:
+                continue
+            if not value.startswith("."):
+                value = "." + value
+            if len(value) > 20 or any(char in value for char in "/\\:*?\"<>|"):
+                continue
+            if value not in exts:
+                exts.append(value)
+        if not exts:
+            raise ToolError("укажите хотя бы одно расширение, например .py")
+        if len(exts) > 10:
+            raise ToolError("слишком много расширений (до 10)")
+
+        target = self.resolve(raw_path, must_exist=True)
+        if is_secret_dir(target.name):
+            raise ToolError("эта папка закрыта: в ней могут быть секреты")
+
+        limit = max(1, min(5000, int(max_files or 2000)))
+        per_extension = {ext: [0, 0] for ext in exts}
+        files = 0
+        lines = 0
+        scanned = 0
+        skipped = 0
+        truncated = False
+
+        for path in self._iter_files(target):
+            if should_stop is not None and should_stop():
+                truncated = True
+                break
+            scanned += 1
+            if scanned > 20_000:
+                truncated = True
+                break
+            if files >= limit:
+                truncated = True
+                break
+
+            extension = path.suffix.casefold()
+            if extension not in per_extension:
+                continue
+
+            encoding = self._ensure_searchable(path)
+            if encoding is None:
+                skipped += 1
+                continue
+
+            count = 0
+            try:
+                with path.open("r", encoding=encoding, errors="replace") as handle:
+                    for _line in handle:
+                        count += 1
+                        if (
+                            count % 2000 == 0
+                            and should_stop is not None
+                            and should_stop()
+                        ):
+                            truncated = True
+                            break
+            except (OSError, UnicodeError):
+                skipped += 1
+                continue
+            if truncated:
+                break
+
+            files += 1
+            lines += count
+            per_extension[extension][0] += 1
+            per_extension[extension][1] += count
+
+        header = [
+            f"Подсчёт строк: {target}",
+            f"Всего: файлов {files}, строк {lines}",
+        ]
+        for extension in exts:
+            file_count, line_count = per_extension[extension]
+            header.append(f"{extension}: файлов {file_count}, строк {line_count}")
+        if truncated:
+            header.append("Достигнут лимит — результат неполный.")
+        if skipped:
+            header.append(f"Пропущено двоичных/нечитаемых файлов: {skipped}.")
+        if not files:
+            header.append("Подходящих файлов не найдено.")
+        return "\n".join(header)

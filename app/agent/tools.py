@@ -145,6 +145,37 @@ TOOL_SCHEMAS: list[dict] = [
             ),
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "count_lines",
+            "description": (
+                "Посчитать строки в файлах с указанными расширениями "
+                "(например, .py и .toml). Возвращает только статистику, "
+                "без содержимого файлов."
+            ),
+            "parameters": _schema(
+                {
+                    "path": {
+                        "type": "string",
+                        "description": "Папка или файл. По умолчанию корень.",
+                    },
+                    "extensions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Расширения, например [\".py\", \".toml\"].",
+                    },
+                    "max_files": {
+                        "type": "integer",
+                        "description": "Сколько подходящих файлов обработать (1–5000).",
+                        "minimum": 1,
+                        "maximum": 5000,
+                    },
+                },
+                ["extensions"],
+            ),
+        },
+    },
 ]
 
 
@@ -201,10 +232,35 @@ def _search_text(
     )
 
 
+def _count_lines(
+    workspace: Workspace,
+    args: dict,
+    should_stop: Callable[[], bool] | None,
+) -> ToolResult:
+    path = _path_arg(args)
+    extensions = args.get("extensions")
+    if isinstance(extensions, str):
+        extensions = [
+            part for part in extensions.replace(",", " ").split() if part
+        ]
+    if not isinstance(extensions, list):
+        raise ToolError(
+            "extensions должен быть списком, например [\".py\", \".toml\"]"
+        )
+    max_files = _as_int(args.get("max_files"), 2000)
+    content = workspace.count_lines(path, extensions, max_files, should_stop)
+    pretty = ", ".join(str(item) for item in extensions)
+    return ToolResult(
+        content=content,
+        summary=_short(f"считаю строки {pretty} в «{path}»"),
+    )
+
+
 _HANDLERS: dict[str, Callable] = {
     "list_dir": _list_dir,
     "read_file": _read_file,
     "search_text": _search_text,
+    "count_lines": _count_lines,
 }
 
 

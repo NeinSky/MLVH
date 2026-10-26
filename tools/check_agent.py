@@ -118,6 +118,17 @@ def _offline() -> int:
         check("list_dir скрывает .env", ".env" not in listing, listing[:160])
         check("list_dir показывает sample.txt", "sample.txt" in listing, listing[:160])
 
+        from app.agent import call_tool
+
+        counted = call_tool(
+            "count_lines", '{"extensions": [".txt"]}', workspace
+        )
+        check(
+            "count_lines считает .txt",
+            counted.ok and "строк 2" in counted.content,
+            counted.content,
+        )
+
         # --- нормальный цикл: инструмент, затем ответ ---
         print("агентский цикл:")
         script = [
