@@ -11,7 +11,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from app.agent import AgentLimits, AgentRunner, Workspace
+from app.agent import AgentLimits, AgentRunner, ToolContext
 from app.asr.base import ASREngine, ASRError
 from app.config import ASRSettings, TTSSettings
 from app.deepseek_client import DeepSeekClient, DeepSeekError
@@ -102,7 +102,7 @@ class AgentWorker(QThread):
         self,
         client: DeepSeekClient,
         messages: list[dict],
-        workspace: Workspace,
+        context: ToolContext,
         limits: AgentLimits,
         *,
         context_tokens: int,
@@ -112,7 +112,7 @@ class AgentWorker(QThread):
         super().__init__(parent)
         self._client = client
         self._messages = messages
-        self._workspace = workspace
+        self._context = context
         self._limits = limits
         self._context_tokens = context_tokens
         self._max_tokens = max_tokens
@@ -125,7 +125,7 @@ class AgentWorker(QThread):
         runner = AgentRunner(
             self._client,
             self._messages,
-            self._workspace,
+            self._context,
             self._limits,
             context_tokens=self._context_tokens,
             max_tokens=self._max_tokens,
@@ -145,6 +145,8 @@ class AgentWorker(QThread):
             if not self._cancel.is_set():
                 self.failed.emit(f"Ошибка агента: {exc}")
             return
+        finally:
+            self._close_web()
 
         if reply is None or self._cancel.is_set():
             return
@@ -155,6 +157,16 @@ class AgentWorker(QThread):
             )
             return
         self.finished_ok.emit(reply.text, reply.usage)
+
+    def _close_web(self) -> None:
+        """Одна сессия на вопрос: после ответа закрываем интернет-ресурсы."""
+        web = self._context.web
+        if web is None:
+            return
+        try:
+            web.close()
+        except Exception:  # закрытие не должно портить ответ
+            pass
 
 
 class PrepareWorker(QThread):

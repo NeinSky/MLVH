@@ -10,7 +10,7 @@ from typing import Callable
 
 from app.agent.context import context_budget, trim_messages
 from app.agent.policy import AgentLimits, Workspace
-from app.agent.tools import TOOL_SCHEMAS, call_tool
+from app.agent.tools import ToolContext, call_tool, tool_schemas
 from app.deepseek_client import DeepSeekClient, DeepSeekError, ToolCall
 
 def _stop_text(human: str, detail: str) -> str:
@@ -53,7 +53,7 @@ class AgentRunner:
         self,
         client: DeepSeekClient,
         messages: list[dict],
-        workspace: Workspace,
+        context: ToolContext | Workspace,
         limits: AgentLimits,
         *,
         context_tokens: int,
@@ -67,7 +67,15 @@ class AgentRunner:
     ) -> None:
         self._client = client
         self._messages = [dict(message) for message in messages]
-        self._workspace = workspace
+        self._context = (
+            context
+            if isinstance(context, ToolContext)
+            else ToolContext(workspace=context)
+        )
+        self._tools = tool_schemas(
+            files=self._context.workspace is not None,
+            web=self._context.web is not None,
+        )
         self._limits = limits
         self._budget = context_budget(context_tokens, max_tokens)
         self._cancel = cancel or threading.Event()
@@ -218,11 +226,11 @@ class AgentRunner:
                 return self._finish(text, usage, rounds, calls, code)
 
             try:
-                result = self._request(self._current_messages(), TOOL_SCHEMAS)
+                result = self._request(self._current_messages(), self._tools)
             except DeepSeekError as exc:
-                # Первый запрос не принял tools (например, прокси) — отвечаем без файлов.
+                # Первый запрос не принял tools (например, прокси) — отвечаем без инструментов.
                 if calls == 0:
-                    self._note(f"Инструменты недоступны ({exc}); отвечаю без файлов.")
+                    self._note(f"Инструменты недоступны ({exc}); отвечаю без инструментов.")
                     result = self._request(self._current_messages(), None)
                 else:
                     raise
@@ -245,7 +253,7 @@ class AgentRunner:
                         )
                         result = self._request(
                             self._current_messages(),
-                            TOOL_SCHEMAS,
+                            self._tools,
                             client=retry_client,
                         )
                         rounds += 1
@@ -295,7 +303,7 @@ class AgentRunner:
                     tool_result = call_tool(
                         call.name,
                         call.arguments,
-                        self._workspace,
+                        self._context,
                         self._cancel.is_set,
                     )
                     content = tool_result.content

@@ -214,7 +214,15 @@ def _offline() -> int:
 
 
 def _live(args) -> int:
-    from app.agent import AgentLimits, AgentRunner, Workspace, build_agent_prompt
+    from app.agent import (
+        AgentLimits,
+        AgentRunner,
+        ToolContext,
+        WebLimits,
+        WebSession,
+        Workspace,
+        build_agent_prompt,
+    )
     from app.config import get_api_key, load_settings
     from app.deepseek_client import DeepSeekClient, DeepSeekError
 
@@ -230,94 +238,123 @@ def _live(args) -> int:
     if model.thinking:
         max_tokens = max(max_tokens, 2000)
 
-    with tempfile.TemporaryDirectory(prefix="mlvh_live_") as tmp:
-        if args.folder:
-            folder = Path(args.folder).expanduser()
-        else:
-            folder = Path(tmp)
-            (folder / "sample.txt").write_text(
-                "Меня зовут MLVH.\nПроект начат в 2026 году.\nСекрет: сорок два.\n",
-                encoding="utf-8",
+    web = WebSession(WebLimits.from_settings(settings.agent)) if args.browse else None
+    try:
+        with tempfile.TemporaryDirectory(prefix="mlvh_live_") as tmp:
+            folder: Path | None = None
+            if not args.browse:
+                folder = Path(args.folder).expanduser() if args.folder else Path(tmp)
+                if not args.folder:
+                    (folder / "sample.txt").write_text(
+                        "Меня зовут MLVH.\nПроект начат в 2026 году.\n"
+                        "Секрет: сорок два.\n",
+                        encoding="utf-8",
+                    )
+
+            if args.browse:
+                question = args.question or (
+                    "Найди в интернете, что такое DuckDuckGo, и коротко ответь "
+                    "с указанием источника."
+                )
+            elif args.folder:
+                question = args.question or (
+                    "Что находится в этой папке? Перечисли файлы и коротко опиши."
+                )
+            else:
+                question = args.question or "Прочитай sample.txt и скажи, что за секрет."
+
+            limits = AgentLimits.from_settings(settings.agent)
+            workspace = Workspace([folder], limits) if folder is not None else None
+            if workspace is not None and not workspace:
+                for raw, why in workspace.skipped:
+                    print(f"  FAIL папка {raw}: {why}")
+                return 1
+
+            context = ToolContext(workspace=workspace, web=web)
+            if context.workspace is None and context.web is None:
+                print("  FAIL нечего разрешать: укажите --folder или --browse")
+                return 1
+
+            system = build_agent_prompt(
+                settings.system_prompt,
+                context.workspace,
+                limits,
+                context.web.limits if context.web is not None else None,
             )
-        question = args.question or (
-            "Что находится в этой папке? Перечисли файлы и коротко опиши."
-            if args.folder
-            else "Прочитай sample.txt и скажи, что за секрет."
-        )
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": question},
+            ]
+            try:
+                client = DeepSeekClient(
+                    api_key=key,
+                    model=model.name,
+                    temperature=model.temperature,
+                    max_tokens=max_tokens,
+                    thinking=model.thinking,
+                )
+            except DeepSeekError as exc:
+                print(f"  FAIL {exc}")
+                return 1
 
-        limits = AgentLimits.from_settings(settings.agent)
-        workspace = Workspace([folder], limits)
-        if not workspace:
-            for raw, why in workspace.skipped:
-                print(f"  FAIL папка {raw}: {why}")
-            return 1
+            def on_tool(summary: str) -> None:
+                print(f"  [инструмент] {summary}", flush=True)
 
-        system = build_agent_prompt(settings.system_prompt, workspace, limits)
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": question},
-        ]
-        try:
-            client = DeepSeekClient(
-                api_key=key,
-                model=model.name,
-                temperature=model.temperature,
+            def on_note(message: str) -> None:
+                print(f"  [агент] {message}", flush=True)
+
+            streamed = False
+
+            def on_content(chunk: str) -> None:
+                nonlocal streamed
+                streamed = True
+                print(chunk, end="", flush=True)
+
+            print(f"Вопрос: {question}")
+            runner = AgentRunner(
+                client,
+                messages,
+                context,
+                limits,
+                context_tokens=model.context_tokens,
                 max_tokens=max_tokens,
-                thinking=model.thinking,
+                on_content=on_content,
+                on_tool=on_tool,
+                on_note=on_note,
             )
-        except DeepSeekError as exc:
-            print(f"  FAIL {exc}")
-            return 1
+            try:
+                reply = runner.run()
+            except DeepSeekError as exc:
+                print(f"\n  FAIL {exc}")
+                return 1
+            print()
+            if reply is None:
+                print("  FAIL агент остановлен без ответа")
+                return 1
+            if not streamed and reply.text:
+                print(reply.text)
 
-        def on_tool(summary: str) -> None:
-            print(f"  [инструмент] {summary}", flush=True)
-
-        def on_note(message: str) -> None:
-            print(f"  [агент] {message}", flush=True)
-
-        streamed = False
-
-        def on_content(chunk: str) -> None:
-            nonlocal streamed
-            streamed = True
-            print(chunk, end="", flush=True)
-
-        print(f"Вопрос: {question}")
-        runner = AgentRunner(
-            client,
-            messages,
-            workspace,
-            limits,
-            context_tokens=model.context_tokens,
-            max_tokens=max_tokens,
-            on_content=on_content,
-            on_tool=on_tool,
-            on_note=on_note,
-        )
-        try:
-            reply = runner.run()
-        except DeepSeekError as exc:
-            print(f"\n  FAIL {exc}")
-            return 1
-        print()
-        if reply is None:
-            print("  FAIL агент остановлен без ответа")
-            return 1
-        if not streamed and reply.text:
-            print(reply.text)
-
-        print(
-            f"Шагов: {reply.rounds}, вызовов: {reply.tool_calls}, "
-            f"причина: {reply.stopped}"
-        )
-        check("агент вызвал инструмент", reply.tool_calls > 0, str(reply.tool_calls))
-        check("ответ не пустой", bool(reply.text.strip()), reply.text)
-        if not args.folder:
-            check(
-                "ответ содержит секрет",
-                "сорок два" in reply.text.casefold(),
-                reply.text,
+            print(
+                f"Шагов: {reply.rounds}, вызовов: {reply.tool_calls}, "
+                f"причина: {reply.stopped}"
             )
+            check("агент вызвал инструмент", reply.tool_calls > 0, str(reply.tool_calls))
+            check("ответ не пустой", bool(reply.text.strip()), reply.text)
+            if args.browse:
+                check(
+                    "ответ ссылается на источник",
+                    "http" in reply.text.casefold(),
+                    reply.text,
+                )
+            elif not args.folder:
+                check(
+                    "ответ содержит секрет",
+                    "сорок два" in reply.text.casefold(),
+                    reply.text,
+                )
+    finally:
+        if web is not None:
+            web.close()
 
     print()
     if FAILED:
@@ -325,6 +362,7 @@ def _live(args) -> int:
         return 1
     print("Живая проверка агента пройдена.")
     return 0
+
 
 
 def main() -> int:
@@ -336,6 +374,11 @@ def main() -> int:
         help="папка для --live (по умолчанию временная с sample.txt)",
     )
     parser.add_argument("--question", metavar="TEXT", help="вопрос для --live")
+    parser.add_argument(
+        "--browse",
+        action="store_true",
+        help="для --live: разрешить агенту интернет (поиск и чтение страниц)",
+    )
     args = parser.parse_args()
     return _live(args) if args.live else _offline()
 

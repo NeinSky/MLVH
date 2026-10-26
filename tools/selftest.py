@@ -120,6 +120,17 @@ def test_settings() -> None:
           settings.agent.max_tool_chars == 800_000,
           str(settings.agent.max_tool_chars))
     check("history_turns больше не пишется", "history_turns" not in data)
+    check("интернет выключен по умолчанию", settings.agent.web_enabled is False)
+    check("страниц по умолчанию — 10", settings.agent.web_max_pages == 10,
+          str(settings.agent.web_max_pages))
+    check("поисков по умолчанию — 5", settings.agent.web_max_searches == 5,
+          str(settings.agent.web_max_searches))
+    check("отрисовка по умолчанию auto", settings.agent.web_render == "auto",
+          settings.agent.web_render)
+    check("прокси по умолчанию auto", settings.agent.web_proxy == "auto",
+          settings.agent.web_proxy)
+    check("локальная сеть по умолчанию закрыта",
+          settings.agent.web_allow_local is False)
 
     restored = Settings.from_dict(data)
     check("round-trip сохраняет движок", restored.tts.engine == settings.tts.engine)
@@ -127,7 +138,10 @@ def test_settings() -> None:
           [p.id for p in restored.personas] == [p.id for p in settings.personas])
     check("round-trip сохраняет окно и лимиты",
           restored.model.context_tokens == settings.model.context_tokens
-          and restored.agent.max_rounds == settings.agent.max_rounds)
+          and restored.agent.max_rounds == settings.agent.max_rounds
+          and restored.agent.web_max_pages == settings.agent.web_max_pages
+          and restored.agent.web_render == settings.agent.web_render
+          and restored.agent.web_proxy == settings.agent.web_proxy)
 
     broken = Settings.from_dict(
         {"agent": {"max_rounds": 99, "max_seconds": 1, "roots": "D:\\x"}}
@@ -222,6 +236,14 @@ def test_example_config() -> None:
           str(agent.get("max_tool_calls")))
     check("версия лимитов в примере", agent.get("limits_version") == 2,
           str(agent.get("limits_version")))
+    check("интернет в примере выключен", agent.get("web_enabled") is False,
+          str(agent.get("web_enabled")))
+    check("лимиты интернета в примере",
+          agent.get("web_max_searches") == 5
+          and agent.get("web_max_pages") == 10
+          and agent.get("web_render") == "auto"
+          and agent.get("web_proxy") == "auto",
+          str({key: agent.get(key) for key in ("web_max_searches", "web_max_pages", "web_render", "web_proxy")}))
     check("history_turns убран", "history_turns" not in data)
     ids = [item.get("id") for item in data.get("personas") or [] if isinstance(item, dict)]
     check("активный характер есть в списке", data.get("active_persona") in ids,
@@ -433,12 +455,25 @@ def test_agent_policy() -> None:
 def test_agent_tools() -> None:
     print("агент: инструменты")
     from app.agent.policy import AgentLimits, Workspace
-    from app.agent.tools import TOOL_SCHEMAS, call_tool
+    from app.agent.tools import TOOL_SCHEMAS, call_tool, tool_names
 
     names = [item["function"]["name"] for item in TOOL_SCHEMAS]
-    check("четыре инструмента",
-          names == ["list_dir", "read_file", "search_text", "count_lines"],
+    check("шесть инструментов",
+          names == [
+              "list_dir",
+              "read_file",
+              "search_text",
+              "count_lines",
+              "search_web",
+              "open_page",
+          ],
           str(names))
+    check("файлы и интернет разделяются",
+          tool_names(files=True)
+          == ("list_dir", "read_file", "search_text", "count_lines")
+          and tool_names(files=False, web=True) == ("search_web", "open_page")
+          and tool_names(files=False, web=False) == (),
+          f"{tool_names(files=True)} / {tool_names(files=False, web=True)}")
     check("у всех есть описание",
           all(item["function"].get("description") for item in TOOL_SCHEMAS))
 
@@ -502,6 +537,241 @@ def test_agent_tools() -> None:
         bad_ext = call_tool("count_lines", "{}", workspace)
         check("count_lines требует расширения", not bad_ext.ok, bad_ext.content)
 
+
+def test_agent_web() -> None:
+    print("агент: интернет")
+    from app.agent.policy import ToolError
+    from app.agent.tools import ToolContext, call_tool
+    from app.agent.web import (
+        FetchResult,
+        NetworkError,
+        WebLimits,
+        WebSession,
+        decode_body,
+        extract_page,
+        parse_search,
+        probe_chrome,
+        proxy_attempts,
+        validate_url,
+    )
+
+    check("https принимается",
+          validate_url("https://example.com/a?b=1#x")
+          == "https://example.com/a?b=1",
+          validate_url("https://example.com/a?b=1#x"))
+    check("адрес без схемы дополняется",
+          validate_url("example.com") == "https://example.com/",
+          validate_url("example.com"))
+
+    for name, url in (
+        ("file://", "file:///C:/secret.txt"),
+        ("javascript:", "javascript:alert(1)"),
+        ("data:", "data:text/html,<b>x</b>"),
+        ("chrome://", "chrome://settings"),
+        ("ftp://", "ftp://example.com/x"),
+        ("логин в адресе", "https://user:pass@example.com/"),
+        ("localhost", "http://localhost:8080/"),
+        ("127.0.0.1", "http://127.0.0.1/"),
+        ("192.168.x.x", "http://192.168.1.10/"),
+        ("169.254.x.x", "http://169.254.169.254/latest/meta-data"),
+        ("имя без домена", "http://intranet/"),
+    ):
+        try:
+            validate_url(url)
+        except ToolError:
+            check(f"отказ: {name}", True)
+        else:
+            check(f"отказ: {name}", False, url)
+
+    check("allow_local пускает проверочный сервер",
+          validate_url("http://127.0.0.1:8000/x", allow_local=True)
+          == "http://127.0.0.1:8000/x",
+          validate_url("http://127.0.0.1:8000/x", allow_local=True))
+
+    system = "http://127.0.0.1:10809"
+    check("auto: российский домен сначала напрямую",
+          proxy_attempts("https://www.gosuslugi.ru", "auto", system=system)
+          == [None, system],
+          str(proxy_attempts("https://www.gosuslugi.ru", "auto", system=system)))
+    check("auto: остальные сначала через прокси",
+          proxy_attempts("https://example.com", "auto", system=system)
+          == [system, None],
+          str(proxy_attempts("https://example.com", "auto", system=system)))
+    check("без системного прокси — только напрямую",
+          proxy_attempts("https://example.com", "auto", system="") == [None],
+          str(proxy_attempts("https://example.com", "auto", system="")))
+    check("direct игнорирует прокси",
+          proxy_attempts("https://example.com", "direct", system=system) == [None],
+          str(proxy_attempts("https://example.com", "direct", system=system)))
+    check("явный прокси нормализован",
+          proxy_attempts("https://example.com", "127.0.0.1:10809")[0]
+          == "http://127.0.0.1:10809",
+          str(proxy_attempts("https://example.com", "127.0.0.1:10809")))
+
+    html = (
+        "<html><head><title>  Заголовок  </title><style>.x{}</style></head>"
+        "<body><nav>меню</nav><h1>Привет</h1><p>Первый <b>абзац</b>.</p>"
+        '<a href="/next">Следующая страница</a><script>alert(1)</script>'
+        '<a href="http://127.0.0.1/x">локально</a><a href="/next">дубль</a>'
+        "</body></html>"
+    )
+    page = extract_page(html, "https://example.com/base")
+    check("заголовок разобран", page.title == "Заголовок", page.title)
+    check("текст без скриптов и меню",
+          "Привет" in page.text
+          and "alert" not in page.text
+          and "меню" not in page.text,
+          page.text)
+    check("ссылка стала абсолютной",
+          ("https://example.com/next", "Следующая страница") in page.links,
+          str(page.links))
+    check("локальная ссылка скрыта",
+          all("127.0.0.1" not in href for href, _label in page.links),
+          str(page.links))
+    check("дубль ссылки убран", len(page.links) == 1, str(page.links))
+
+    body = "<meta charset=windows-1251><p>Привет</p>".encode("cp1251")
+    check("cp1251 из meta", "Привет" in decode_body(body), decode_body(body))
+
+    search_html = """
+    <div class="result results_links"><h2 class="result__title">
+    <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fnews%3Fid%3D1&rut=x">Новость дня</a>
+    </h2><a class="result__snippet" href="#">Коротко <b>о</b> главном.</a></div>
+    <div class="result result--ad">
+    <a class="result__a" href="https://ads.example.org/x">Реклама</a></div>
+    <div class="result results_links">
+    <a class="result__a" href="https://example.com/next">Вторая</a>
+    <div class="result__snippet">Описание второй.</div></div>
+    """
+    items = parse_search(search_html)
+    check("выдача: два результата без рекламы", len(items) == 2, str(items))
+    check("ссылка uddg раскодирована",
+          items[0].url == "https://example.com/news?id=1",
+          items[0].url)
+    check("сниппет из ссылки",
+          "главном" in items[0].snippet.casefold(), items[0].snippet)
+    check("сниппет из div",
+          "второй" in items[1].snippet.casefold(), items[1].snippet)
+
+    js_html = (
+        "<html><body><div id='root'></div><script>"
+        + "x" * 4000
+        + "</script></body></html>"
+    )
+
+    class FakeFetch:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        def __call__(self, url: str) -> FetchResult:
+            self.urls.append(url)
+            if "duckduckgo" in url:
+                return FetchResult(
+                    200, url, "text/html; charset=utf-8", search_html.encode("utf-8")
+                )
+            if url.endswith("/js"):
+                return FetchResult(200, url, "text/html", js_html.encode("utf-8"))
+            return FetchResult(
+                200,
+                "https://example.com/final",
+                "text/html; charset=utf-8",
+                html.encode("utf-8"),
+            )
+
+    def fake_render(url: str) -> str:
+        return (
+            "<html><head><title>JS</title></head><body><p>"
+            + "Отрисованный текст. " * 40
+            + "</p></body></html>"
+        )
+
+    def broken_fetch(url: str) -> FetchResult:
+        raise NetworkError("не удалось подключиться: тест")
+
+    fallback = WebSession(
+        WebLimits(max_pages=1), fetch=broken_fetch, render=fake_render
+    )
+    fallback_text = fallback.open_page("https://example.com/broken", 2000)
+    check(
+        "Chrome подменяет упавший HTTP",
+        "Отрисованный текст" in fallback_text
+        and "открыта через Chrome" in fallback_text,
+        fallback_text[:240],
+    )
+
+    fetcher = FakeFetch()
+    session = WebSession(
+        WebLimits(max_searches=1, max_pages=2, max_chars=5000),
+        fetch=fetcher,
+        render=fake_render,
+    )
+    listing = session.search("новости")
+    check("поиск вернул заголовок и адрес",
+          "Новость дня" in listing and "example.com/news" in listing,
+          listing)
+    check("повторный поиск берётся из кэша",
+          session.search("новости") == listing and session.searches_used == 1,
+          str(session.searches_used))
+    try:
+        session.search("другое")
+    except ToolError:
+        check("лимит поисков", True)
+    else:
+        check("лимит поисков", False)
+
+    content = session.open_page("https://example.com/a", 2000)
+    check("страница открыта",
+          "Текст страницы" in content and "Привет" in content, content[:200])
+    check("источник указан",
+          "URL: https://example.com/final" in content, content[:200])
+    check("ссылки в результате",
+          "- Следующая страница — https://example.com/next" in content,
+          content)
+
+    js_content = session.open_page("https://example.com/js", 2000)
+    check("JS-страница отрисована Chrome",
+          "Отрисованный текст" in js_content
+          and "отрисована в Chrome" in js_content,
+          js_content[:220])
+
+    limited = WebSession(WebLimits(max_pages=1), fetch=fetcher)
+    limited.open_page("https://example.com/a")
+    try:
+        limited.open_page("https://example.com/b")
+    except ToolError:
+        check("лимит страниц", True)
+    else:
+        check("лимит страниц", False)
+
+    try:
+        WebSession(fetch=fetcher).open_page("http://127.0.0.1/x")
+    except ToolError:
+        check("open_page не пускает localhost", True)
+    else:
+        check("open_page не пускает localhost", False)
+
+    ctx = ToolContext(web=WebSession(WebLimits(), fetch=fetcher, render=fake_render))
+    result = call_tool(
+        "open_page",
+        json.dumps({"url": "https://example.com/a", "max_chars": 2000}),
+        ctx,
+    )
+    check("open_page через диспетчер",
+          result.ok and "Привет" in result.content, result.content[:160])
+    check("подпись «открываю»", "открываю" in result.summary, result.summary)
+    search_result = call_tool("search_web", json.dumps({"query": "новости"}), ctx)
+    check("search_web через диспетчер",
+          search_result.ok and "Новость дня" in search_result.content,
+          search_result.content[:160])
+
+    missing = call_tool("search_web", '{"query": "x"}', ToolContext())
+    check("без разрешения интернет закрыт",
+          not missing.ok and "интернет" in missing.content.casefold(),
+          missing.content)
+
+    chrome, hint = probe_chrome()
+    check("probe Chrome даёт путь или подсказку",
+          bool(chrome) != bool(hint), f"{chrome} / {hint}")
 
 def test_agent_context() -> None:
     print("агент: контекст")
@@ -912,7 +1182,7 @@ def test_core_without_qt() -> None:
         "import app.asr.audio, app.asr.base, app.asr.hotkeys;"
         "import app.asr.wakeword, app.asr.registry;"
         "import app.agent, app.agent.policy, app.agent.context;"
-        "import app.agent.tools, app.agent.runner;"
+        "import app.agent.tools, app.agent.runner, app.agent.web;"
         "print('PySide6' in sys.modules)"
     )
     try:
@@ -980,6 +1250,7 @@ def main() -> int:
         test_wake_word,
         test_agent_policy,
         test_agent_tools,
+        test_agent_web,
         test_agent_context,
         test_tool_call_accumulator,
         test_agent_runner,

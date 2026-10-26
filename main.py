@@ -76,6 +76,16 @@ def main() -> int:
         metavar="N",
         help="предел шагов агента для --ask (по умолчанию 20)",
     )
+    parser.add_argument(
+        "--browse",
+        action="store_true",
+        help="разрешить интернет на один запуск, даже если в настройках выключено",
+    )
+    parser.add_argument(
+        "--allow-local-url",
+        action="store_true",
+        help="для проверок: разрешить локальные адреса (127.0.0.1) в --ask",
+    )
     args = parser.parse_args()
 
     settings = load_settings()
@@ -239,12 +249,15 @@ def _transcribe_file(path: str, settings: Settings) -> int:
 
 
 def _ask(text: str, settings: Settings, args) -> int:
-    """Один вопрос агенту в консоли: проверка чтения файлов без окна."""
+    """Один вопрос агенту в консоли: чтение файлов и/или интернет без окна."""
     from dataclasses import replace
 
     from app.agent import (
         AgentLimits,
         AgentRunner,
+        ToolContext,
+        WebLimits,
+        WebSession,
         Workspace,
         build_agent_prompt,
         build_messages,
@@ -275,9 +288,28 @@ def _ask(text: str, settings: Settings, args) -> int:
             print(f"Папка пропущена: {raw} — {why}")
         workspace = None
 
+    if args.browse:
+        settings.agent.web_allow_local = bool(args.allow_local_url)
+    web = (
+        WebSession(WebLimits.from_settings(settings.agent))
+        if (args.browse or settings.agent.web_enabled)
+        else None
+    )
+
+    context = (
+        ToolContext(workspace=workspace, web=web)
+        if workspace is not None or web is not None
+        else None
+    )
+
     system_prompt = settings.system_prompt
-    if workspace is not None:
-        system_prompt = build_agent_prompt(system_prompt, workspace, limits)
+    if context is not None:
+        system_prompt = build_agent_prompt(
+            system_prompt,
+            context.workspace,
+            limits,
+            context.web.limits if context.web is not None else None,
+        )
 
     trimmed = build_messages(
         system_prompt,
@@ -298,7 +330,7 @@ def _ask(text: str, settings: Settings, args) -> int:
         print(f"Ошибка: {exc}")
         return 1
 
-    if workspace is None:
+    if context is None:
         try:
             for event in client.stream_chat(trimmed.messages):
                 if event.kind == "content":
@@ -325,7 +357,7 @@ def _ask(text: str, settings: Settings, args) -> int:
     runner = AgentRunner(
         client,
         trimmed.messages,
-        workspace,
+        context,
         limits,
         context_tokens=model.context_tokens,
         max_tokens=max_tokens,
@@ -338,6 +370,9 @@ def _ask(text: str, settings: Settings, args) -> int:
     except DeepSeekError as exc:
         print(f"\nОшибка: {exc}")
         return 1
+    finally:
+        if web is not None:
+            web.close()
 
     if reply is None:
         print("\nОстановлено.")

@@ -137,9 +137,16 @@ class ASRSettings:
         return settings
 
 
+def _as_bool_value(value: object) -> bool:
+    """Галочка из config.json может быть строкой — понимаем и так."""
+    if isinstance(value, str):
+        return value.strip().casefold() in ("1", "true", "да", "yes")
+    return bool(value)
+
+
 @dataclass
 class AgentSettings:
-    """Права и пределы агента: пока только чтение файлов."""
+    """Права и пределы агента: чтение файлов и интернет."""
 
     read_enabled: bool = False          # право «Чтение»: галочка в разделе «Агент»
     roots: list[str] = field(default_factory=list)   # рабочие папки (абсолютные пути)
@@ -151,21 +158,26 @@ class AgentSettings:
     max_file_bytes: int = 262_144       # сколько текста вернуть за одно чтение (256 КБ)
     max_read_lines: int = 400           # строк за одно чтение
     max_tool_chars: int = 800_000       # суммарный объём результатов инструментов
+    # --- интернет ---
+    web_enabled: bool = False           # право «Интернет»: поиск и чтение страниц
+    web_max_searches: int = 5           # поисков на один вопрос
+    web_max_pages: int = 10             # страниц на один вопрос
+    web_max_results: int = 8            # ссылок в одной выдаче
+    web_max_chars: int = 20_000         # символов страницы в контекст
+    web_timeout: int = 15               # секунд на один запрос
+    web_render: str = "auto"            # auto / always / never — когда звать Chrome
+    web_proxy: str = "auto"             # auto / system / direct / http://host:port
+    web_allow_local: bool = False       # только для проверок на локальном сервере
+    chrome_path: str = ""               # пусто — ищем Chrome сами
 
     @classmethod
     def from_dict(cls, data: dict) -> "AgentSettings":
         raw_version = _clamp_int(data.get("limits_version"), 1, 1, 999)
         settings = cls(**_known_values(cls, data))
-        raw_enabled = settings.read_enabled
-        if isinstance(raw_enabled, str):
-            settings.read_enabled = raw_enabled.strip().casefold() in (
-                "1",
-                "true",
-                "да",
-                "yes",
-            )
-        else:
-            settings.read_enabled = bool(raw_enabled)
+        settings.read_enabled = _as_bool_value(settings.read_enabled)
+        settings.web_enabled = _as_bool_value(settings.web_enabled)
+        settings.web_allow_local = _as_bool_value(settings.web_allow_local)
+        settings.chrome_path = str(settings.chrome_path or "").strip()
 
         roots: list[str] = []
         raw_roots = settings.roots if isinstance(settings.roots, list) else []
@@ -191,6 +203,30 @@ class AgentSettings:
         settings.max_tool_chars = _clamp_int(
             settings.max_tool_chars, 800_000, 10_000, 4_000_000
         )
+        settings.web_max_searches = _clamp_int(settings.web_max_searches, 5, 1, 20)
+        settings.web_max_pages = _clamp_int(settings.web_max_pages, 10, 1, 50)
+        settings.web_max_results = _clamp_int(settings.web_max_results, 8, 1, 10)
+        settings.web_max_chars = _clamp_int(
+            settings.web_max_chars, 20_000, 2000, 100_000
+        )
+        settings.web_timeout = _clamp_int(settings.web_timeout, 15, 5, 60)
+        render = str(settings.web_render or "auto").strip().casefold()
+        if render not in ("auto", "always", "never"):
+            print(
+                f"[config] Неизвестный режим отрисовки «{settings.web_render}» — "
+                "включён auto."
+            )
+            render = "auto"
+        settings.web_render = render
+        proxy = str(settings.web_proxy or "auto").strip()
+        lowered = proxy.casefold()
+        if lowered in ("", "auto"):
+            proxy = "auto"
+        elif lowered in ("system", "direct"):
+            proxy = lowered
+        elif "://" not in proxy:
+            proxy = "http://" + proxy
+        settings.web_proxy = proxy
 
         if raw_version < 2:
             # В 0.3.0 шаги по умолчанию были 6, спинбокс — до 12, вызовов — 12.
@@ -365,6 +401,16 @@ class Settings:
                 "max_file_bytes": self.agent.max_file_bytes,
                 "max_read_lines": self.agent.max_read_lines,
                 "max_tool_chars": self.agent.max_tool_chars,
+                "web_enabled": self.agent.web_enabled,
+                "web_max_searches": self.agent.web_max_searches,
+                "web_max_pages": self.agent.web_max_pages,
+                "web_max_results": self.agent.web_max_results,
+                "web_max_chars": self.agent.web_max_chars,
+                "web_timeout": self.agent.web_timeout,
+                "web_render": self.agent.web_render,
+                "web_proxy": self.agent.web_proxy,
+                "web_allow_local": self.agent.web_allow_local,
+                "chrome_path": self.agent.chrome_path,
             },
             "system_prompt": self.system_prompt,
             "active_persona": self.active_persona,

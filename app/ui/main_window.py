@@ -39,9 +39,13 @@ from PySide6.QtWidgets import (
 from app import __version__
 from app.agent import (
     AgentLimits,
+    ToolContext,
+    WebLimits,
+    WebSession,
     Workspace,
     build_agent_prompt,
     build_messages,
+    probe_chrome,
     validate_root,
 )
 from app.asr import audio
@@ -566,6 +570,15 @@ class MainWindow(QMainWindow):
         self.agent_read_check.toggled.connect(self._on_agent_read)
         agent_layout.addWidget(self.agent_read_check)
 
+        self.agent_web_check = QCheckBox("Интернет: поиск и чтение страниц")
+        self.agent_web_check.setToolTip(
+            "Разрешить агенту искать в интернете (DuckDuckGo) и открывать страницы.\n"
+            "Страницы на JavaScript отрисовываются в Chrome.\n"
+            "Только чтение: кликов, форм и загрузок нет. file:// и локальная сеть закрыты."
+        )
+        self.agent_web_check.toggled.connect(self._on_agent_web)
+        agent_layout.addWidget(self.agent_web_check)
+
         self.agent_roots = QListWidget()
         self.agent_roots.setMaximumHeight(92)
         self.agent_roots.setTextElideMode(Qt.TextElideMode.ElideMiddle)
@@ -661,6 +674,7 @@ class MainWindow(QMainWindow):
             self.thinking_check,
             self.persona_combo,
             self.agent_read_check,
+            self.agent_web_check,
             self.agent_rounds_spin,
         ):
             widget.blockSignals(True)
@@ -673,6 +687,7 @@ class MainWindow(QMainWindow):
         self.speak_check.setChecked(bool(tts.enabled))
         self.thinking_check.setChecked(bool(model.thinking))
         self.agent_read_check.setChecked(bool(self.settings.agent.read_enabled))
+        self.agent_web_check.setChecked(bool(self.settings.agent.web_enabled))
         self.agent_rounds_spin.setValue(int(self.settings.agent.max_rounds))
         for widget in (
             self.model_combo,
@@ -680,6 +695,7 @@ class MainWindow(QMainWindow):
             self.thinking_check,
             self.persona_combo,
             self.agent_read_check,
+            self.agent_web_check,
             self.agent_rounds_spin,
         ):
             widget.blockSignals(False)
@@ -760,32 +776,50 @@ class MainWindow(QMainWindow):
 
     def _refresh_agent_ui(self) -> None:
         agent = self.settings.agent
-        if not agent.read_enabled:
-            self.agent_hint.setText("Агент выключен: включите «Чтение файлов».")
-            return
-        if not agent.roots:
-            self.agent_hint.setText("Чтение включено, но нет ни одной рабочей папки.")
-            return
+        parts: list[str] = []
 
-        available = 0
-        missing: list[str] = []
-        for raw in agent.roots:
-            resolved, error = validate_root(raw)
-            if resolved is None:
-                missing.append(f"{raw} ({error})")
+        if agent.read_enabled:
+            if not agent.roots:
+                parts.append("Файлы: чтение включено, но нет ни одной рабочей папки.")
             else:
-                available += 1
+                available = 0
+                missing: list[str] = []
+                for raw in agent.roots:
+                    resolved, error = validate_root(raw)
+                    if resolved is None:
+                        missing.append(f"{raw} ({error})")
+                    else:
+                        available += 1
+                if available:
+                    text = f"Файлы: папок — {available}. Агент видит только их."
+                    if missing:
+                        text += "\nНедоступно: " + "; ".join(missing)
+                    parts.append(text)
+                else:
+                    parts.append(
+                        "Файлы: рабочие папки недоступны: " + "; ".join(missing)
+                    )
 
-        if available:
-            text = f"Чтение: папок — {available}. Агент видит только их."
-            if missing:
-                text += "\nНедоступно: " + "; ".join(missing)
-            self.agent_hint.setText(text)
-        else:
-            self.agent_hint.setText("Рабочие папки недоступны: " + "; ".join(missing))
+        if agent.web_enabled:
+            chrome, hint = probe_chrome(agent.chrome_path)
+            if chrome:
+                parts.append("Интернет: поиск и страницы. Chrome найден.")
+            else:
+                parts.append("Интернет: поиск и страницы. " + hint)
+
+        if not parts:
+            parts.append(
+                "Агент выключен: включите «Чтение файлов» и/или «Интернет»."
+            )
+        self.agent_hint.setText("\n".join(parts))
 
     def _on_agent_read(self, enabled: bool) -> None:
         self.settings.agent.read_enabled = bool(enabled)
+        self._touch()
+        self._refresh_agent_ui()
+
+    def _on_agent_web(self, enabled: bool) -> None:
+        self.settings.agent.web_enabled = bool(enabled)
         self._touch()
         self._refresh_agent_ui()
 
@@ -854,6 +888,15 @@ class MainWindow(QMainWindow):
                 6000,
             )
         return workspace
+
+    def _agent_context(self) -> ToolContext | None:
+        """Что доступно агенту в этом запросе, или None, если всё выключено."""
+        agent = self.settings.agent
+        workspace = self._agent_workspace()
+        web = WebSession(WebLimits.from_settings(agent)) if agent.web_enabled else None
+        if workspace is None and web is None:
+            return None
+        return ToolContext(workspace=workspace, web=web)
 
     def _on_model_changed(self, name: str) -> None:
         self.settings.model.name = name
@@ -1962,11 +2005,16 @@ class MainWindow(QMainWindow):
             # Рассуждения тоже тратят токены — иначе ответ обрезается или приходит пустым.
             max_tokens = max(max_tokens, 2000)
 
-        workspace = self._agent_workspace()
-        limits = AgentLimits.from_settings(self.settings.agent) if workspace else None
+        context = self._agent_context()
+        limits = AgentLimits.from_settings(self.settings.agent) if context else None
         system_prompt = self.settings.system_prompt
-        if workspace is not None and limits is not None:
-            system_prompt = build_agent_prompt(system_prompt, workspace, limits)
+        if context is not None and limits is not None:
+            system_prompt = build_agent_prompt(
+                system_prompt,
+                context.workspace,
+                limits,
+                context.web.limits if context.web is not None else None,
+            )
         trimmed = build_messages(
             system_prompt,
             self.history,
@@ -1994,13 +2042,13 @@ class MainWindow(QMainWindow):
             return
 
         self._start_pipeline()
-        if workspace is not None and limits is not None:
+        if context is not None and limits is not None:
             # Строки инструментов идут до ответа, поэтому «Имя: » выводим лениво.
             self._reply_started = False
             worker = AgentWorker(
                 client,
                 trimmed.messages,
-                workspace,
+                context,
                 limits,
                 context_tokens=model.context_tokens,
                 max_tokens=max_tokens,
@@ -2273,5 +2321,3 @@ class MainWindow(QMainWindow):
         self._stop_thread(self._voice_worker, 3000)
         TTSService.clear_cache()
         super().closeEvent(event)
-
-
