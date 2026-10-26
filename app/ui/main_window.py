@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from html import escape
@@ -21,6 +22,8 @@ from PySide6.QtWidgets import (
     QKeySequenceEdit,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -34,6 +37,13 @@ from PySide6.QtWidgets import (
 )
 
 from app import __version__
+from app.agent import (
+    AgentLimits,
+    Workspace,
+    build_agent_prompt,
+    build_messages,
+    validate_root,
+)
 from app.asr import audio
 from app.asr.global_hotkey import GlobalHotkey
 from app.asr.hotkeys import normalize as normalize_hotkey
@@ -70,6 +80,7 @@ from app.ui.level_meter import LevelMeter
 from app.ui.mic_dialog import MicDialog
 from app.ui.persona_dialog import PersonaDialog
 from app.ui.workers import (
+    AgentWorker,
     ChatWorker,
     PrepareWorker,
     SpeakWorker,
@@ -109,6 +120,11 @@ QPushButton#Primary:hover { background: #1d4ed8; }
 QComboBox, QSpinBox {
     background: #0b1220; border: 1px solid #1f2937; border-radius: 8px; padding: 5px 8px;
 }
+QListWidget {
+    background: #0b1220; border: 1px solid #1f2937; border-radius: 8px; padding: 4px;
+}
+QListWidget::item { padding: 3px 4px; }
+QListWidget::item:selected { background: #1f2937; color: #f9fafb; }
 QSlider::groove:horizontal { height: 4px; background: #1f2937; border-radius: 2px; }
 QSlider::handle:horizontal {
     width: 14px; margin: -6px 0; border-radius: 7px; background: #3b82f6;
@@ -119,6 +135,15 @@ QPushButton#Mic { min-width: 32px; padding: 5px 6px; font-size: 16px; }
 QPushButton#Mic[state="recording"] { background: #b91c1c; border-color: #ef4444; }
 QPushButton#Mic[state="busy"] { background: #b45309; border-color: #f59e0b; }
 """
+
+
+def _format_tokens(value: int) -> str:
+    """1_000_000 → «1M», 128_000 → «128K» — для строки статуса."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:g}M"
+    if value >= 1000:
+        return f"{value // 1000}K"
+    return str(value)
 
 
 class MainWindow(QMainWindow):
@@ -133,9 +158,10 @@ class MainWindow(QMainWindow):
         self._pending_user_index: int | None = None
         self._last_reply = ""
         self._reply_parts: list[str] = []
+        self._reply_started = True
         self._voices: list[dict] = []
         self._body_fmt = QTextCharFormat()
-        self._chat_worker: ChatWorker | None = None
+        self._chat_worker: ChatWorker | AgentWorker | None = None
         self._speak_worker: SpeakWorker | None = None
         self._voice_worker: VoiceListWorker | None = None
         self._pipeline: SpeechPipeline | None = None
@@ -529,6 +555,51 @@ class MainWindow(QMainWindow):
         dialog_layout.addWidget(clear_button)
         layout.addWidget(dialog_box)
 
+        agent_box = QGroupBox("Агент")
+        agent_layout = QVBoxLayout(agent_box)
+
+        self.agent_read_check = QCheckBox("Чтение файлов")
+        self.agent_read_check.setToolTip(
+            "Разрешить агенту читать файлы в указанных папках.\n"
+            "Записи, удаления и запуска команд нет — только чтение."
+        )
+        self.agent_read_check.toggled.connect(self._on_agent_read)
+        agent_layout.addWidget(self.agent_read_check)
+
+        self.agent_roots = QListWidget()
+        self.agent_roots.setMaximumHeight(92)
+        self.agent_roots.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.agent_roots.currentRowChanged.connect(lambda _row: self._sync_agent_buttons())
+        agent_layout.addWidget(self.agent_roots)
+
+        agent_buttons = QHBoxLayout()
+        self.add_agent_root_button = QPushButton("Добавить папку…")
+        self.add_agent_root_button.clicked.connect(self._add_agent_root)
+        self.remove_agent_root_button = QPushButton("Удалить")
+        self.remove_agent_root_button.clicked.connect(self._remove_agent_root)
+        agent_buttons.addWidget(self.add_agent_root_button)
+        agent_buttons.addWidget(self.remove_agent_root_button)
+        agent_layout.addLayout(agent_buttons)
+
+        rounds_row = QHBoxLayout()
+        rounds_row.addWidget(QLabel("Шагов:"))
+        self.agent_rounds_spin = QSpinBox()
+        self.agent_rounds_spin.setRange(1, 12)
+        self.agent_rounds_spin.setToolTip(
+            "Сколько раз агент может обратиться к файлам за один вопрос.\n"
+            "Повторные одинаковые вызовы, время и объём данных ограничены отдельно."
+        )
+        self.agent_rounds_spin.valueChanged.connect(self._on_agent_rounds)
+        rounds_row.addWidget(self.agent_rounds_spin)
+        rounds_row.addStretch()
+        agent_layout.addLayout(rounds_row)
+
+        self.agent_hint = QLabel("")
+        self.agent_hint.setWordWrap(True)
+        self.agent_hint.setStyleSheet("color:#6b7280;")
+        agent_layout.addWidget(self.agent_hint)
+        layout.addWidget(agent_box)
+
         hint = QLabel(
             "Голос — бесплатный Edge TTS (нужен интернет).\n"
             "Ответы — DeepSeek, нужен ключ с platform.deepseek.com."
@@ -582,7 +653,14 @@ class MainWindow(QMainWindow):
         model = self.settings.model
         tts = self.settings.tts
 
-        for widget in (self.model_combo, self.speak_check, self.thinking_check, self.persona_combo):
+        for widget in (
+            self.model_combo,
+            self.speak_check,
+            self.thinking_check,
+            self.persona_combo,
+            self.agent_read_check,
+            self.agent_rounds_spin,
+        ):
             widget.blockSignals(True)
         self.model_combo.setCurrentText(
             model.name if model.name in AVAILABLE_MODELS else AVAILABLE_MODELS[0]
@@ -592,7 +670,16 @@ class MainWindow(QMainWindow):
             self.persona_combo.setCurrentIndex(persona_index)
         self.speak_check.setChecked(bool(tts.enabled))
         self.thinking_check.setChecked(bool(model.thinking))
-        for widget in (self.model_combo, self.speak_check, self.thinking_check, self.persona_combo):
+        self.agent_read_check.setChecked(bool(self.settings.agent.read_enabled))
+        self.agent_rounds_spin.setValue(int(self.settings.agent.max_rounds))
+        for widget in (
+            self.model_combo,
+            self.speak_check,
+            self.thinking_check,
+            self.persona_combo,
+            self.agent_read_check,
+            self.agent_rounds_spin,
+        ):
             widget.blockSignals(False)
 
         self.rate_slider.setValue(int(tts.rate))
@@ -644,6 +731,10 @@ class MainWindow(QMainWindow):
             widget.blockSignals(False)
         self._refresh_mic_ui()
 
+        self._populate_agent_roots()
+        self._sync_agent_buttons()
+        self._refresh_agent_ui()
+
     def _touch(self) -> None:
         """Настройки меняются часто — пишем файл с небольшой задержкой."""
         self._save_timer.start()
@@ -653,6 +744,114 @@ class MainWindow(QMainWindow):
             save_settings(self.settings)
         except OSError as exc:
             self.statusBar().showMessage(f"Не удалось сохранить настройки: {exc}", 5000)
+
+    # --- агент ----------------------------------------------------------
+    def _populate_agent_roots(self) -> None:
+        self.agent_roots.clear()
+        for root in self.settings.agent.roots:
+            item = QListWidgetItem(root)
+            item.setToolTip(root)
+            self.agent_roots.addItem(item)
+
+    def _sync_agent_buttons(self) -> None:
+        self.remove_agent_root_button.setEnabled(self.agent_roots.currentRow() >= 0)
+
+    def _refresh_agent_ui(self) -> None:
+        agent = self.settings.agent
+        if not agent.read_enabled:
+            self.agent_hint.setText("Агент выключен: включите «Чтение файлов».")
+            return
+        if not agent.roots:
+            self.agent_hint.setText("Чтение включено, но нет ни одной рабочей папки.")
+            return
+
+        available = 0
+        missing: list[str] = []
+        for raw in agent.roots:
+            resolved, error = validate_root(raw)
+            if resolved is None:
+                missing.append(f"{raw} ({error})")
+            else:
+                available += 1
+
+        if available:
+            text = f"Чтение: папок — {available}. Агент видит только их."
+            if missing:
+                text += "\nНедоступно: " + "; ".join(missing)
+            self.agent_hint.setText(text)
+        else:
+            self.agent_hint.setText("Рабочие папки недоступны: " + "; ".join(missing))
+
+    def _on_agent_read(self, enabled: bool) -> None:
+        self.settings.agent.read_enabled = bool(enabled)
+        self._touch()
+        self._refresh_agent_ui()
+
+    def _on_agent_rounds(self, value: int) -> None:
+        self.settings.agent.max_rounds = int(value)
+        self._touch()
+
+    def _add_agent_root(self) -> None:
+        roots = self.settings.agent.roots
+        start = roots[-1] if roots else str(Path.home())
+        folder = QFileDialog.getExistingDirectory(
+            self, "Рабочая папка агента (только чтение)", start
+        )
+        if not folder:
+            return
+
+        resolved, error = validate_root(folder)
+        if resolved is None:
+            QMessageBox.warning(self, "Агент", f"Эту папку нельзя добавить: {error}")
+            return
+
+        key = os.path.normcase(str(resolved))
+        existing = {os.path.normcase(str(Path(raw))) for raw in roots}
+        if key in existing:
+            self.statusBar().showMessage("Эта папка уже добавлена", 3000)
+            return
+
+        roots.append(str(resolved))
+        self._populate_agent_roots()
+        self.agent_roots.setCurrentRow(self.agent_roots.count() - 1)
+        self._sync_agent_buttons()
+        self._refresh_agent_ui()
+        self._touch()
+        self.statusBar().showMessage(f"Папка добавлена: {resolved}", 4000)
+
+    def _remove_agent_root(self) -> None:
+        row = self.agent_roots.currentRow()
+        if row < 0 or row >= len(self.settings.agent.roots):
+            return
+
+        removed = self.settings.agent.roots.pop(row)
+        self._populate_agent_roots()
+        if self.settings.agent.roots:
+            self.agent_roots.setCurrentRow(
+                min(row, self.agent_roots.count() - 1)
+            )
+        self._sync_agent_buttons()
+        self._refresh_agent_ui()
+        self._touch()
+        self.statusBar().showMessage(f"Папка убрана: {removed}", 3000)
+
+    def _agent_workspace(self) -> Workspace | None:
+        """Рабочие папки текущего запроса или None, если агент выключен."""
+        agent = self.settings.agent
+        if not agent.read_enabled or not agent.roots:
+            return None
+
+        workspace = Workspace(agent.roots, AgentLimits.from_settings(agent))
+        if not workspace:
+            self.statusBar().showMessage("Агент: нет доступных рабочих папок", 5000)
+            return None
+        if workspace.skipped:
+            self.statusBar().showMessage(
+                "Агент: пропущены недоступные папки — "
+                + "; ".join(f"{path} ({why})" for path, why in workspace.skipped),
+                6000,
+            )
+        return workspace
 
     def _on_model_changed(self, name: str) -> None:
         self.settings.model.name = name
@@ -1711,8 +1910,19 @@ class MainWindow(QMainWindow):
 
         self.chat.setTextCursor(cursor)
         self._scroll_to_end()
+        self._reply_started = True
+
+    def _ensure_reply_started(self) -> None:
+        """Ответ агента начинается после строк инструментов — префикс выводим лениво."""
+        if not self._reply_started:
+            self._begin_assistant()
+
+    def _on_agent_tool(self, summary: str) -> None:
+        self._insert_line("Агент: ", summary, "#34d399", "#a7f3d0")
+        self.statusBar().showMessage(f"Агент: {summary}")
 
     def _on_chunk(self, text: str) -> None:
+        self._ensure_reply_started()
         self._reply_parts.append(text)
         if self._pipeline is not None:
             self._pipeline.push(text)
@@ -1744,14 +1954,30 @@ class MainWindow(QMainWindow):
         self.history.append({"role": "user", "content": text})
         self._pending_user_index = len(self.history) - 1
 
-        messages = [{"role": "system", "content": self.settings.system_prompt}]
-        messages += self.history[-self.settings.history_turns * 2:]
-
         model = self.settings.model
         max_tokens = model.max_tokens
         if model.thinking:
             # Рассуждения тоже тратят токены — иначе ответ обрезается или приходит пустым.
             max_tokens = max(max_tokens, 2000)
+
+        workspace = self._agent_workspace()
+        limits = AgentLimits.from_settings(self.settings.agent) if workspace else None
+        system_prompt = self.settings.system_prompt
+        if workspace is not None and limits is not None:
+            system_prompt = build_agent_prompt(system_prompt, workspace, limits)
+        trimmed = build_messages(
+            system_prompt,
+            self.history,
+            model.context_tokens,
+            max_tokens,
+        )
+        if trimmed.dropped:
+            self.statusBar().showMessage(
+                f"Контекст: {trimmed.dropped} старых реплик не поместились "
+                "и пропущены",
+                5000,
+            )
+
         try:
             client = DeepSeekClient(
                 api_key=key,
@@ -1765,9 +1991,23 @@ class MainWindow(QMainWindow):
             self._show_error(str(exc))
             return
 
-        self._begin_assistant()
         self._start_pipeline()
-        worker = ChatWorker(client, messages, self)
+        if workspace is not None and limits is not None:
+            # Строки инструментов идут до ответа, поэтому «Имя: » выводим лениво.
+            self._reply_started = False
+            worker = AgentWorker(
+                client,
+                trimmed.messages,
+                workspace,
+                limits,
+                context_tokens=model.context_tokens,
+                max_tokens=max_tokens,
+                parent=self,
+            )
+            worker.tool.connect(self._on_agent_tool)
+        else:
+            self._begin_assistant()
+            worker = ChatWorker(client, trimmed.messages, self)
         worker.chunk.connect(self._on_chunk)
         worker.reasoning.connect(self._on_reasoning)
         worker.note.connect(lambda text: self.statusBar().showMessage(text))
@@ -1803,6 +2043,10 @@ class MainWindow(QMainWindow):
         reply = text.strip()
         self._last_reply = reply
 
+        if reply and not self._reply_started:
+            # Текст не пришёл потоком (редкий случай) — показываем целиком.
+            self._on_chunk(reply)
+
         if reply:
             self.history.append({"role": "assistant", "content": reply})
             self._pending_user_index = None
@@ -1810,18 +2054,34 @@ class MainWindow(QMainWindow):
             self._drop_pending_question()
             self._on_chunk("(пустой ответ)")
 
+        warning = ""
         if usage:
+            extra = ""
+            rounds = int(usage.get("rounds", 0) or 0)
+            tool_calls = int(usage.get("tool_calls", 0) or 0)
+            if rounds:
+                extra += f" · шагов {rounds}"
+            if tool_calls:
+                extra += f", чтений {tool_calls}"
             self.tokens_label.setText(
                 f"токены: {usage.get('total_tokens', 0)} "
-                f"(вход {usage.get('prompt_tokens', 0)} / выход {usage.get('completion_tokens', 0)})"
+                f"(вход {usage.get('prompt_tokens', 0)} / "
+                f"выход {usage.get('completion_tokens', 0)})"
+                f"{extra} · окно {_format_tokens(self.settings.model.context_tokens)}"
             )
+            prompt_tokens = int(
+                usage.get("max_prompt_tokens", usage.get("prompt_tokens", 0)) or 0
+            )
+            if prompt_tokens >= self.settings.model.context_tokens * 0.9:
+                warning = "Контекст почти заполнен — начните новый диалог"
         if usage.get("truncated"):
             self._on_chunk(" …")
-            self.statusBar().showMessage(
-                "Ответ обрезан лимитом токенов — увеличьте max_tokens в config.json", 8000
-            )
+            warning = "Ответ обрезан лимитом токенов — увеличьте max_tokens в config.json"
 
-        self.statusBar().showMessage("Готов", 3000)
+        if warning:
+            self.statusBar().showMessage(warning, 8000)
+        else:
+            self.statusBar().showMessage("Готов", 3000)
         if reply:
             self._finish_pipeline()
         else:
@@ -1958,6 +2218,7 @@ class MainWindow(QMainWindow):
         self.history.clear()
         self._pending_user_index = None
         self._last_reply = ""
+        self._reply_started = True
         self.chat.clear()
         self.chat.setHtml(
             f'<p style="color:#94a3b8;">Новый диалог. {escape(self._assistant_name())} слушает.</p>'

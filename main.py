@@ -58,6 +58,24 @@ def main() -> int:
         metavar="FILE",
         help="распознать wav-файл и выйти",
     )
+    parser.add_argument(
+        "--ask",
+        metavar="TEXT",
+        help="задать один вопрос агенту в консоли (без окна и озвучки)",
+    )
+    parser.add_argument(
+        "--read-folder",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="разрешить агенту чтение папки для --ask (можно несколько раз)",
+    )
+    parser.add_argument(
+        "--agent-rounds",
+        type=int,
+        metavar="N",
+        help="предел шагов агента для --ask (1–12)",
+    )
     args = parser.parse_args()
 
     settings = load_settings()
@@ -68,6 +86,8 @@ def main() -> int:
         return _mic_test(args.mic_test)
     if args.transcribe:
         return _transcribe_file(args.transcribe, settings)
+    if args.ask:
+        return _ask(args.ask, settings, args)
 
     if args.list_personas:
         return _list_personas(settings)
@@ -216,6 +236,120 @@ def _transcribe_file(path: str, settings: Settings) -> int:
 
     print(text or "(пусто)")
     return 0
+
+
+def _ask(text: str, settings: Settings, args) -> int:
+    """Один вопрос агенту в консоли: проверка чтения файлов без окна."""
+    from dataclasses import replace
+
+    from app.agent import (
+        AgentLimits,
+        AgentRunner,
+        Workspace,
+        build_agent_prompt,
+        build_messages,
+    )
+    from app.deepseek_client import DeepSeekClient, DeepSeekError
+
+    key = get_api_key()
+    if not key:
+        print("Не задан ключ DeepSeek: положите DEEPSEEK_API_KEY в .env.")
+        return 1
+
+    model = settings.model
+    max_tokens = model.max_tokens
+    if model.thinking:
+        max_tokens = max(max_tokens, 2000)
+
+    limits = AgentLimits.from_settings(settings.agent)
+    if args.agent_rounds:
+        limits = replace(limits, max_rounds=max(1, min(12, args.agent_rounds)))
+
+    roots = list(args.read_folder or [])
+    if not roots and settings.agent.read_enabled:
+        roots = list(settings.agent.roots)
+
+    workspace = Workspace(roots, limits) if roots else None
+    if workspace is not None and not workspace:
+        for raw, why in workspace.skipped:
+            print(f"Папка пропущена: {raw} — {why}")
+        workspace = None
+
+    system_prompt = settings.system_prompt
+    if workspace is not None:
+        system_prompt = build_agent_prompt(system_prompt, workspace, limits)
+
+    trimmed = build_messages(
+        system_prompt,
+        [{"role": "user", "content": text}],
+        model.context_tokens,
+        max_tokens,
+    )
+
+    try:
+        client = DeepSeekClient(
+            api_key=key,
+            model=model.name,
+            temperature=model.temperature,
+            max_tokens=max_tokens,
+            thinking=model.thinking,
+        )
+    except DeepSeekError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+
+    if workspace is None:
+        try:
+            for event in client.stream_chat(trimmed.messages):
+                if event.kind == "content":
+                    print(event.text, end="", flush=True)
+        except DeepSeekError as exc:
+            print(f"\nОшибка: {exc}")
+            return 1
+        print()
+        return 0
+
+    def on_tool(summary: str) -> None:
+        print(f"[агент] {summary}", flush=True)
+
+    def on_note(message: str) -> None:
+        print(f"[агент] {message}", flush=True)
+
+    streamed = False
+
+    def on_content(chunk: str) -> None:
+        nonlocal streamed
+        streamed = True
+        print(chunk, end="", flush=True)
+
+    runner = AgentRunner(
+        client,
+        trimmed.messages,
+        workspace,
+        limits,
+        context_tokens=model.context_tokens,
+        max_tokens=max_tokens,
+        on_content=on_content,
+        on_note=on_note,
+        on_tool=on_tool,
+    )
+    try:
+        reply = runner.run()
+    except DeepSeekError as exc:
+        print(f"\nОшибка: {exc}")
+        return 1
+
+    if reply is None:
+        print("\nОстановлено.")
+        return 1
+    if not streamed and reply.text:
+        print(reply.text, end="")
+    print()
+    print(
+        f"Шагов: {reply.rounds}, вызовов: {reply.tool_calls}, "
+        f"причина остановки: {reply.stopped}"
+    )
+    return 0 if reply.text.strip() else 1
 
 
 def _run_gui(settings: Settings) -> int:

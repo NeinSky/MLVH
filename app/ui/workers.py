@@ -11,6 +11,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from app.agent import AgentLimits, AgentRunner, Workspace
 from app.asr.base import ASREngine, ASRError
 from app.config import ASRSettings, TTSSettings
 from app.deepseek_client import DeepSeekClient, DeepSeekError
@@ -85,6 +86,75 @@ class ChatWorker(QThread):
             elif event.kind == "usage" and event.usage:
                 usage = event.usage
         return "".join(parts), usage, finish
+
+
+class AgentWorker(QThread):
+    """Агентский цикл: стримит итоговый ответ и сообщает о вызовах инструментов."""
+
+    chunk = Signal(str)
+    reasoning = Signal(str)
+    note = Signal(str)
+    tool = Signal(str)
+    finished_ok = Signal(str, dict)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        client: DeepSeekClient,
+        messages: list[dict],
+        workspace: Workspace,
+        limits: AgentLimits,
+        *,
+        context_tokens: int,
+        max_tokens: int,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._client = client
+        self._messages = messages
+        self._workspace = workspace
+        self._limits = limits
+        self._context_tokens = context_tokens
+        self._max_tokens = max_tokens
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def run(self) -> None:
+        runner = AgentRunner(
+            self._client,
+            self._messages,
+            self._workspace,
+            self._limits,
+            context_tokens=self._context_tokens,
+            max_tokens=self._max_tokens,
+            cancel=self._cancel,
+            on_content=self.chunk.emit,
+            on_reasoning=self.reasoning.emit,
+            on_note=self.note.emit,
+            on_tool=self.tool.emit,
+        )
+        try:
+            reply = runner.run()
+        except DeepSeekError as exc:
+            if not self._cancel.is_set():
+                self.failed.emit(str(exc))
+            return
+        except Exception as exc:  # поток не должен умирать молча
+            if not self._cancel.is_set():
+                self.failed.emit(f"Ошибка агента: {exc}")
+            return
+
+        if reply is None or self._cancel.is_set():
+            return
+        if not reply.text.strip():
+            self.failed.emit(
+                "Модель не дала ответа. Попробуйте переформулировать вопрос "
+                "или уменьшить объём чтения."
+            )
+            return
+        self.finished_ok.emit(reply.text, reply.usage)
 
 
 class PrepareWorker(QThread):

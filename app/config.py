@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -37,6 +37,15 @@ def _known_values(cls: type, data: dict) -> dict:
     return {key: value for key, value in data.items() if key in names}
 
 
+def _clamp_int(value: object, default: int, minimum: int, maximum: int) -> int:
+    """Битое значение из config.json не должно ронять запуск."""
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(maximum, number))
+
+
 @dataclass
 class ModelSettings:
     """Параметры запроса к DeepSeek."""
@@ -45,10 +54,17 @@ class ModelSettings:
     temperature: float = 0.7
     max_tokens: int = 2000
     thinking: bool = False
+    # Размер окна модели. deepseek-flash теперь обслуживается DeepSeek-V4.1,
+    # у которого до 1M токенов: историю режем по токенам, а не по числу реплик.
+    context_tokens: int = 1_000_000
 
     @classmethod
     def from_dict(cls, data: dict) -> "ModelSettings":
-        return cls(**_known_values(cls, data))
+        settings = cls(**_known_values(cls, data))
+        settings.context_tokens = _clamp_int(
+            settings.context_tokens, 1_000_000, 32_000, 2_000_000
+        )
+        return settings
 
 
 @dataclass
@@ -122,14 +138,65 @@ class ASRSettings:
 
 
 @dataclass
+class AgentSettings:
+    """Права и пределы агента: пока только чтение файлов."""
+
+    read_enabled: bool = False          # право «Чтение»: галочка в разделе «Агент»
+    roots: list[str] = field(default_factory=list)   # рабочие папки (абсолютные пути)
+    max_rounds: int = 6                 # шагов с инструментами на один вопрос
+    duplicate_limit: int = 2            # сколько раз можно повторить один и тот же вызов
+    max_tool_calls: int = 12            # всего вызовов инструментов на один вопрос
+    max_seconds: int = 120              # предел времени на весь агентский цикл
+    max_file_bytes: int = 262_144       # сколько текста вернуть за одно чтение (256 КБ)
+    max_read_lines: int = 400           # строк за одно чтение
+    max_tool_chars: int = 400_000       # суммарный объём результатов инструментов
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AgentSettings":
+        settings = cls(**_known_values(cls, data))
+        raw_enabled = settings.read_enabled
+        if isinstance(raw_enabled, str):
+            settings.read_enabled = raw_enabled.strip().casefold() in (
+                "1",
+                "true",
+                "да",
+                "yes",
+            )
+        else:
+            settings.read_enabled = bool(raw_enabled)
+
+        roots: list[str] = []
+        raw_roots = settings.roots if isinstance(settings.roots, list) else []
+        for item in raw_roots:
+            if isinstance(item, (str, Path)):
+                text = str(item).strip()
+                if text:
+                    roots.append(text)
+        settings.roots = roots
+
+        settings.max_rounds = _clamp_int(settings.max_rounds, 6, 1, 12)
+        settings.duplicate_limit = _clamp_int(settings.duplicate_limit, 2, 1, 5)
+        settings.max_tool_calls = _clamp_int(settings.max_tool_calls, 12, 1, 40)
+        settings.max_seconds = _clamp_int(settings.max_seconds, 120, 10, 600)
+        settings.max_file_bytes = _clamp_int(
+            settings.max_file_bytes, 262_144, 4096, 4_000_000
+        )
+        settings.max_read_lines = _clamp_int(settings.max_read_lines, 400, 50, 2000)
+        settings.max_tool_chars = _clamp_int(
+            settings.max_tool_chars, 400_000, 10_000, 2_000_000
+        )
+        return settings
+
+
+@dataclass
 class Settings:
     """Все настройки приложения."""
 
     model: ModelSettings = None
     tts: TTSSettings = None
     asr: ASRSettings = None
+    agent: AgentSettings = None
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
-    history_turns: int = 10
     personas: list[Persona] = None
     active_persona: str = DEFAULT_PERSONA_ID
 
@@ -140,6 +207,8 @@ class Settings:
             self.tts = TTSSettings()
         if self.asr is None:
             self.asr = ASRSettings()
+        if self.agent is None:
+            self.agent = AgentSettings()
         if not self.personas:
             # Конфига нет: характеры встроенные, поэтому сразу берём пресет
             # характера по умолчанию — иначе промпт и голос разъедутся.
@@ -189,6 +258,7 @@ class Settings:
         model = ModelSettings.from_dict(data.get("model") or {})
         tts = TTSSettings.from_dict(data.get("tts") or {})
         asr = ASRSettings.from_dict(data.get("asr") or {})
+        agent = AgentSettings.from_dict(data.get("agent") or {})
         personas = _read_personas(data.get("personas"))
         system_prompt = data.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
         active = data.get("active_persona")
@@ -214,8 +284,8 @@ class Settings:
             model=model,
             tts=tts,
             asr=asr,
+            agent=agent,
             system_prompt=system_prompt,
-            history_turns=int(data.get("history_turns") or 10),
             personas=personas,
             active_persona=active,
         )
@@ -227,6 +297,7 @@ class Settings:
                 "temperature": self.model.temperature,
                 "max_tokens": self.model.max_tokens,
                 "thinking": self.model.thinking,
+                "context_tokens": self.model.context_tokens,
             },
             "tts": {
                 "engine": self.tts.engine,
@@ -264,8 +335,18 @@ class Settings:
                 "max_seconds": self.asr.max_seconds,
                 "mute_while_speaking": self.asr.mute_while_speaking,
             },
+            "agent": {
+                "read_enabled": self.agent.read_enabled,
+                "roots": list(self.agent.roots),
+                "max_rounds": self.agent.max_rounds,
+                "duplicate_limit": self.agent.duplicate_limit,
+                "max_tool_calls": self.agent.max_tool_calls,
+                "max_seconds": self.agent.max_seconds,
+                "max_file_bytes": self.agent.max_file_bytes,
+                "max_read_lines": self.agent.max_read_lines,
+                "max_tool_chars": self.agent.max_tool_chars,
+            },
             "system_prompt": self.system_prompt,
-            "history_turns": self.history_turns,
             "active_persona": self.active_persona,
             "personas": [persona.to_dict() for persona in self.personas],
         }

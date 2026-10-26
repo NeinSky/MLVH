@@ -105,11 +105,42 @@ def test_settings() -> None:
 
     data = settings.to_dict()
     check("сериализуется в JSON", isinstance(json.dumps(data), str))
+    check("окно модели по умолчанию — 1M",
+          settings.model.context_tokens == 1_000_000,
+          str(settings.model.context_tokens))
+    check("агент выключен по умолчанию", settings.agent.read_enabled is False)
+    check("рабочих папок нет", settings.agent.roots == [], str(settings.agent.roots))
+    check("history_turns больше не пишется", "history_turns" not in data)
 
     restored = Settings.from_dict(data)
     check("round-trip сохраняет движок", restored.tts.engine == settings.tts.engine)
     check("round-trip сохраняет характеры",
           [p.id for p in restored.personas] == [p.id for p in settings.personas])
+    check("round-trip сохраняет окно и лимиты",
+          restored.model.context_tokens == settings.model.context_tokens
+          and restored.agent.max_rounds == settings.agent.max_rounds)
+
+    broken = Settings.from_dict(
+        {"agent": {"max_rounds": 99, "max_seconds": 1, "roots": "D:\\x"}}
+    )
+    check("лимит шагов зажат", broken.agent.max_rounds == 12,
+          str(broken.agent.max_rounds))
+    check("предел времени зажат", broken.agent.max_seconds == 10,
+          str(broken.agent.max_seconds))
+    check("кривые roots игнорируются", broken.agent.roots == [],
+          str(broken.agent.roots))
+
+    broken_text = Settings.from_dict(
+        {
+            "model": {"context_tokens": "abc"},
+            "agent": {"max_rounds": "abc", "read_enabled": "true"},
+        }
+    )
+    check("битое окно → 1M", broken_text.model.context_tokens == 1_000_000,
+          str(broken_text.model.context_tokens))
+    check("битый лимит → 6", broken_text.agent.max_rounds == 6,
+          str(broken_text.agent.max_rounds))
+    check("строка true → включено", broken_text.agent.read_enabled is True)
 
     # Старый конфиг без характеров превращается в «Мой голос».
     legacy = Settings.from_dict({"tts": {"voice": "ru-RU-SvetlanaNeural", "rate": 7}})
@@ -117,6 +148,7 @@ def test_settings() -> None:
           legacy.active_persona)
     check("миграция сохраняет голос",
           legacy.tts.voice == "ru-RU-SvetlanaNeural", legacy.tts.voice)
+    check("агент старых конфигов выключен", legacy.agent.read_enabled is False)
 
 
 def test_audio_helpers() -> None:
@@ -139,6 +171,11 @@ def test_example_config() -> None:
     data = json.loads(path.read_text(encoding="utf-8"))
     check("есть tts", "tts" in data)
     check("есть характеры", bool(data.get("personas")))
+    check("есть агент", "agent" in data)
+    check("окно модели 1M",
+          (data.get("model") or {}).get("context_tokens") == 1_000_000,
+          str((data.get("model") or {}).get("context_tokens")))
+    check("history_turns убран", "history_turns" not in data)
     ids = [item.get("id") for item in data.get("personas") or [] if isinstance(item, dict)]
     check("активный характер есть в списке", data.get("active_persona") in ids,
           str(data.get("active_persona")))
@@ -273,6 +310,516 @@ def test_wake_word() -> None:
           repr(strip_wake_word("Помощник, сколько времени?", "помощник")))
 
 
+def test_agent_policy() -> None:
+    print("агент: политика доступа")
+    from app.agent.policy import AgentLimits, ToolError, Workspace, validate_root
+
+    with tempfile.TemporaryDirectory(prefix="mlvh_policy_") as tmp:
+        base = Path(tmp)
+        root = base / "root"
+        root.mkdir()
+        (root / "ok.txt").write_text("внутри\n", encoding="utf-8")
+        (root / ".env").write_text("SECRET=1\n", encoding="utf-8")
+        (root / "bin.dat").write_bytes(b"\x00\x01")
+        (root / "lines.txt").write_text("1\n2\n3\n4\n5\n", encoding="utf-8")
+        (base / "outside.txt").write_text("снаружи\n", encoding="utf-8")
+
+        workspace = Workspace([root], AgentLimits())
+        check("корень принят", bool(workspace), str(workspace.skipped))
+        check("несуществующая папка пропущена",
+              not Workspace([base / "nope"]))
+        drive_root = Path.cwd().anchor
+        check("корень диска отклонён", validate_root(drive_root)[0] is None,
+              str(validate_root(drive_root)))
+
+        try:
+            text = workspace.read_file("ok.txt")
+        except ToolError as exc:
+            check("чтение внутри папки", False, str(exc))
+        else:
+            check("чтение внутри папки", "внутри" in text, text)
+
+        for name, call in (
+            ("выход через ..", lambda: workspace.read_file("../outside.txt")),
+            ("абсолютный путь наружу",
+             lambda: workspace.read_file(str(base / "outside.txt"))),
+            ("секрет .env", lambda: workspace.read_file(".env")),
+            ("двоичный файл", lambda: workspace.read_file("bin.dat")),
+            ("несуществующий файл", lambda: workspace.read_file("nope.txt")),
+        ):
+            try:
+                call()
+            except ToolError:
+                check(name, True)
+            else:
+                check(name, False, "отказа не было")
+
+        chunk = workspace.read_file("lines.txt", 2, 2)
+        check("постраничное чтение",
+              "2: 2" in chunk and "3: 3" in chunk and "4: 4" not in chunk,
+              chunk.replace("\n", " | "))
+        check("пометка о продолжении", "продолжается" in chunk, chunk)
+
+        listing = workspace.list_dir(".", 50)
+        check("секрет скрыт в списке", ".env" not in listing, listing)
+        check("файл виден в списке", "ok.txt" in listing, listing)
+
+        found = workspace.search_text("внутри", ".", 10)
+        check("поиск находит текст", "ok.txt" in found, found)
+        secret = workspace.search_text("SECRET", ".", 10)
+        check("поиск не видит секреты", "Ничего не найдено" in secret, secret)
+
+        link = root / "link.txt"
+        try:
+            link.symlink_to(base / "outside.txt")
+        except (OSError, NotImplementedError) as exc:
+            print(f"  пропуск: симлинки недоступны ({exc})")
+        else:
+            try:
+                workspace.read_file("link.txt")
+            except ToolError:
+                check("симлинк наружу отклонён", True)
+            else:
+                check("симлинк наружу отклонён", False, "прочитался")
+
+
+def test_agent_tools() -> None:
+    print("агент: инструменты")
+    from app.agent.policy import AgentLimits, Workspace
+    from app.agent.tools import TOOL_SCHEMAS, call_tool
+
+    names = [item["function"]["name"] for item in TOOL_SCHEMAS]
+    check("три инструмента",
+          names == ["list_dir", "read_file", "search_text"], str(names))
+    check("у всех есть описание",
+          all(item["function"].get("description") for item in TOOL_SCHEMAS))
+
+    with tempfile.TemporaryDirectory(prefix="mlvh_tools_") as tmp:
+        root = Path(tmp)
+        (root / "a.txt").write_text("Привет, мир\n", encoding="utf-8")
+        workspace = Workspace([root], AgentLimits())
+
+        result = call_tool("read_file", '{"path": "a.txt"}', workspace)
+        check("read_file через диспетчер",
+              result.ok and "Привет" in result.content, result.content)
+        check("краткое описание для чата", "читаю" in result.summary, result.summary)
+
+        bad_json = call_tool("read_file", "{oops", workspace)
+        check("битый JSON — ошибка",
+              not bad_json.ok and "JSON" in bad_json.content, bad_json.content)
+
+        unknown = call_tool("write_file", "{}", workspace)
+        check("неизвестный инструмент",
+              not unknown.ok and "неизвестный" in unknown.content, unknown.content)
+
+        outside = call_tool("read_file", json.dumps({"path": "../x"}), workspace)
+        check("инструмент не выпускает наружу", not outside.ok, outside.content)
+
+        query = call_tool("search_text", json.dumps({"query": "мир"}), workspace)
+        check("search_text через диспетчер",
+              query.ok and "a.txt" in query.content, query.content)
+
+
+def test_agent_context() -> None:
+    print("агент: контекст")
+    from app.agent.context import (
+        build_messages,
+        context_budget,
+        estimate_tokens,
+        trim_messages,
+    )
+
+    check("оценка растёт",
+          estimate_tokens("привет") > 0
+          and estimate_tokens("привет" * 10) > estimate_tokens("привет"))
+    check("бюджет меньше окна",
+          context_budget(1_000_000, 2000) < 1_000_000)
+    check("бюджет не уходит в минус",
+          context_budget(32_000, 30_000) >= 4096)
+
+    system = {"role": "system", "content": "системный промпт"}
+    history: list[dict] = []
+    for index in range(20):
+        history.append({"role": "user", "content": f"вопрос {index} " + "а" * 500})
+        history.append({"role": "assistant", "content": f"ответ {index} " + "б" * 500})
+    history.append({"role": "user", "content": "последний вопрос"})
+
+    result = trim_messages([system, *history], 1500)
+    check("системный промпт сохранён",
+          result.messages[0]["role"] == "system")
+    check("последний вопрос сохранён",
+          result.messages[-1]["content"] == "последний вопрос",
+          str(result.messages[-1])[:120])
+    check("старое выброшено", result.dropped > 0, str(result.dropped))
+
+    messages = [
+        system,
+        {"role": "user", "content": "что в файле?"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "1", "content": "данные " + "х" * 4000},
+        {"role": "user", "content": "и ещё?"},
+    ]
+
+    intact = trim_messages(messages, 3000)
+    roles = [message["role"] for message in intact.messages]
+    check("группа tool не разорвана",
+          "tool" in roles
+          and roles[roles.index("tool") - 1] == "assistant",
+          str(roles))
+
+    dropped = trim_messages(messages, 800)
+    roles = [message["role"] for message in dropped.messages]
+    check("tool без assistant не остаётся",
+          not (roles and roles[0] == "tool"), str(roles))
+    check("вопрос не потерян",
+          dropped.messages[-1]["content"] == "и ещё?", str(roles))
+
+    huge = trim_messages(
+        [system, {"role": "user", "content": "а" * 100_000}],
+        1000,
+    )
+    check("огромный вопрос обрезан, но не потерян",
+          huge.truncated and huge.messages[-1]["role"] == "user",
+          str(huge.truncated))
+
+    built = build_messages(
+        "система",
+        [{"role": "user", "content": "привет"}],
+        1_000_000,
+        2000,
+    )
+    check("build_messages добавляет system",
+          built.messages[0]["content"] == "система")
+
+
+def test_tool_call_accumulator() -> None:
+    print("агент: склейка tool_calls")
+    from types import SimpleNamespace as NS
+
+    from app.deepseek_client import ToolCallAccumulator
+
+    acc = ToolCallAccumulator()
+    acc.feed([NS(index=0, id="call_1", function=NS(name="read_file", arguments='{"pa'))])
+    acc.feed([NS(index=0, id=None, function=NS(name=None, arguments='th": "a.txt"}'))])
+    calls = acc.finish()
+    check("один вызов", len(calls) == 1, str(len(calls)))
+    check("id собран", bool(calls) and calls[0].id == "call_1",
+          calls[0].id if calls else "нет")
+    check("аргументы собраны",
+          bool(calls) and calls[0].arguments == '{"path": "a.txt"}',
+          calls[0].arguments if calls else "нет")
+
+    parallel = ToolCallAccumulator()
+    parallel.feed(
+        [
+            NS(index=0, id="a", function=NS(name="list_dir", arguments="{}")),
+            NS(index=1, id="b", function=NS(name="read_file", arguments='{"path":"x"}')),
+        ]
+    )
+    two = parallel.finish()
+    check("два параллельных вызова",
+          len(two) == 2 and two[0].name == "list_dir" and two[1].name == "read_file",
+          str(two))
+
+    empty = ToolCallAccumulator()
+    empty.feed([NS(index=0, id=None, function=NS(name="search_text", arguments=None))])
+    synth = empty.finish()
+    check("id синтезирован",
+          bool(synth) and synth[0].id == "call_0",
+          synth[0].id if synth else "нет")
+    check("пустые аргументы — объект",
+          bool(synth) and synth[0].arguments == "{}",
+          synth[0].arguments if synth else "нет")
+
+
+def test_agent_runner() -> None:
+    print("агент: цикл и защита от зацикливания")
+    import threading
+
+    from app.agent.context import context_budget, estimate_message_tokens
+    from app.agent.policy import AgentLimits, Workspace
+    from app.agent.runner import AgentRunner
+    from app.deepseek_client import StreamEvent, ToolCall
+
+    class FakeClient:
+        model = "fake"
+        max_tokens = 1000
+        thinking = False
+
+        def __init__(self, script, tick=None):
+            self.script = list(script)
+            self.calls = 0
+            self.seen = []
+            self.tick = tick
+
+        def stream_chat(self, messages, tools=None):
+            self.calls += 1
+            self.seen.append([dict(message) for message in messages])
+            if self.tick is not None:
+                self.tick()
+            step = self.script.pop(0) if self.script else []
+            if not step:
+                step = [StreamEvent(kind="content", text="Готово.")]
+            for event in step:
+                yield event
+
+        def clone(self, **_kwargs):
+            return self
+
+    with tempfile.TemporaryDirectory(prefix="mlvh_runner_") as tmp:
+        root = Path(tmp)
+        (root / "a.txt").write_text("строка один\nстрока два\n", encoding="utf-8")
+        limits = AgentLimits(
+            max_rounds=4,
+            duplicate_limit=2,
+            max_tool_calls=10,
+            max_seconds=60,
+            max_file_bytes=100_000,
+            max_read_lines=50,
+            max_tool_chars=100_000,
+        )
+        workspace = Workspace([root], limits)
+        base = [
+            {"role": "system", "content": "тест"},
+            {"role": "user", "content": "что в a.txt?"},
+        ]
+
+        client = FakeClient(
+            [
+                [
+                    StreamEvent(
+                        kind="usage",
+                        usage={
+                            "prompt_tokens": 10,
+                            "completion_tokens": 1,
+                            "total_tokens": 11,
+                        },
+                    ),
+                    StreamEvent(
+                        kind="tool_call",
+                        tool_call=ToolCall("1", "read_file", '{"path": "a.txt"}'),
+                    ),
+                ],
+                [
+                    StreamEvent(
+                        kind="usage",
+                        usage={
+                            "prompt_tokens": 20,
+                            "completion_tokens": 5,
+                            "total_tokens": 25,
+                        },
+                    ),
+                    StreamEvent(kind="content", text="Там две строки."),
+                ],
+            ]
+        )
+        summaries: list[str] = []
+        reply = AgentRunner(
+            client,
+            base,
+            workspace,
+            limits,
+            context_tokens=100_000,
+            max_tokens=1000,
+            on_tool=summaries.append,
+        ).run()
+        check("ответ после инструмента",
+              reply is not None and "две строки" in reply.text,
+              reply.text if reply else "None")
+        check("один вызов инструмента",
+              reply is not None and reply.tool_calls == 1,
+              str(reply.tool_calls if reply else "None"))
+        check("подпись вызова в чат",
+              bool(summaries) and "читаю" in summaries[0], str(summaries))
+        tool_messages = [
+            message for message in client.seen[-1] if message.get("role") == "tool"
+        ]
+        check("tool-ответ с тем же id",
+              bool(tool_messages)
+              and tool_messages[0].get("tool_call_id") == "1",
+              str(tool_messages)[:160])
+        check("вход суммируется, максимум учтён",
+              reply is not None
+              and reply.usage.get("prompt_tokens") == 30
+              and reply.usage.get("max_prompt_tokens") == 20,
+              str(reply.usage if reply else "None"))
+
+        same = ToolCall("x", "read_file", '{"path": "a.txt"}')
+        dup_script = [
+            [StreamEvent(kind="tool_call", tool_call=same)] for _ in range(4)
+        ] + [[StreamEvent(kind="content", text="Итог.")]]
+        dup_reply = AgentRunner(
+            FakeClient(dup_script),
+            base,
+            workspace,
+            limits,
+            context_tokens=100_000,
+            max_tokens=1000,
+        ).run()
+        check("дубликаты остановлены",
+              dup_reply is not None and dup_reply.stopped == "stuck",
+              dup_reply.stopped if dup_reply else "None")
+        check("повторов не больше лимита",
+              dup_reply is not None
+              and dup_reply.tool_calls <= limits.duplicate_limit + 2,
+              str(dup_reply.tool_calls if dup_reply else "None"))
+        check("финальный ответ при дубликатах",
+              dup_reply is not None and "Итог" in dup_reply.text,
+              dup_reply.text if dup_reply else "None")
+
+        round_script = [
+            [
+                StreamEvent(
+                    kind="tool_call",
+                    tool_call=ToolCall(
+                        f"c{index}",
+                        "read_file",
+                        json.dumps({"path": "a.txt", "start_line": index + 1}),
+                    ),
+                )
+            ]
+            for index in range(8)
+        ]
+        round_script.insert(4, [StreamEvent(kind="content", text="Хватит.")])
+        round_reply = AgentRunner(
+            FakeClient(round_script),
+            base,
+            workspace,
+            limits,
+            context_tokens=100_000,
+            max_tokens=1000,
+        ).run()
+        check("лимит шагов сработал",
+              round_reply is not None and round_reply.stopped == "rounds",
+              round_reply.stopped if round_reply else "None")
+        check("шагов не больше лимита",
+              round_reply is not None
+              and round_reply.rounds <= limits.max_rounds + 1,
+              str(round_reply.rounds if round_reply else "None"))
+        check("по прочитанному всё равно отвечает",
+              round_reply is not None and "Хватит" in round_reply.text,
+              round_reply.text if round_reply else "None")
+
+        cancel = threading.Event()
+        cancel.set()
+        cancelled_client = FakeClient([])
+        cancelled = AgentRunner(
+            cancelled_client,
+            base,
+            workspace,
+            limits,
+            context_tokens=100_000,
+            max_tokens=1000,
+            cancel=cancel,
+        ).run()
+        check("отмена возвращает None", cancelled is None)
+        check("отмена не делает запросов", cancelled_client.calls == 0,
+              str(cancelled_client.calls))
+
+        now = [0.0]
+
+        def clock() -> float:
+            return now[0]
+
+        def tick() -> None:
+            now[0] += 100
+
+        time_client = FakeClient(
+            [[StreamEvent(kind="tool_call", tool_call=ToolCall("t", "list_dir", "{}"))]],
+            tick=tick,
+        )
+        time_reply = AgentRunner(
+            time_client,
+            base,
+            workspace,
+            limits,
+            context_tokens=100_000,
+            max_tokens=1000,
+            clock=clock,
+        ).run()
+        check("лимит времени сработал",
+              time_reply is not None and time_reply.stopped == "time",
+              time_reply.stopped if time_reply else "None")
+
+        bad_reply = AgentRunner(
+            FakeClient(
+                [
+                    [
+                        StreamEvent(
+                            kind="tool_call",
+                            tool_call=ToolCall(
+                                "bad", "read_file", '{"path": "../secret"}'
+                            ),
+                        )
+                    ],
+                    [StreamEvent(kind="content", text="Не нашёл.")],
+                ]
+            ),
+            base,
+            workspace,
+            limits,
+            context_tokens=100_000,
+            max_tokens=1000,
+        ).run()
+        check("ошибка инструмента не роняет цикл",
+              bad_reply is not None and "Не нашёл" in bad_reply.text,
+              bad_reply.text if bad_reply else "None")
+
+        empty_reply = AgentRunner(
+            FakeClient([[StreamEvent(kind="content", text="")]]),
+            base,
+            workspace,
+            limits,
+            context_tokens=100_000,
+            max_tokens=1000,
+        ).run()
+        check("пустой ответ даёт понятный текст",
+              empty_reply is not None and bool(empty_reply.text.strip()),
+              empty_reply.text if empty_reply else "None")
+
+        # Большой результат чтения не должен раздувать следующий запрос:
+        # перед каждым раундом история обрезается под окно модели.
+        (root / "big.txt").write_text(
+            "\n".join(["а" * 300 for _ in range(50)]), encoding="utf-8"
+        )
+        budget = context_budget(6000, 1000)
+        big_client = FakeClient(
+            [
+                [
+                    StreamEvent(
+                        kind="tool_call",
+                        tool_call=ToolCall("big", "read_file", '{"path": "big.txt"}'),
+                    )
+                ],
+                [StreamEvent(kind="content", text="Готово.")],
+            ]
+        )
+        big_reply = AgentRunner(
+            big_client,
+            base,
+            workspace,
+            limits,
+            context_tokens=6000,
+            max_tokens=1000,
+        ).run()
+        last_tokens = sum(
+            estimate_message_tokens(message) for message in big_client.seen[-1]
+        )
+        check("результат инструмента обрезается под окно",
+              big_reply is not None and last_tokens <= budget,
+              f"{last_tokens} > {budget}")
+
+
 def test_core_without_qt() -> None:
     """В CI PySide6 не ставится: ядро не должно его тянуть даже косвенно."""
     print("ядро без Qt:")
@@ -281,6 +828,8 @@ def test_core_without_qt() -> None:
         "import app.config, app.personas, app.text_norm;"
         "import app.asr.audio, app.asr.base, app.asr.hotkeys;"
         "import app.asr.wakeword, app.asr.registry;"
+        "import app.agent, app.agent.policy, app.agent.context;"
+        "import app.agent.tools, app.agent.runner;"
         "print('PySide6' in sys.modules)"
     )
     try:
@@ -346,6 +895,11 @@ def main() -> int:
         test_asr_audio,
         test_asr_registry,
         test_wake_word,
+        test_agent_policy,
+        test_agent_tools,
+        test_agent_context,
+        test_tool_call_accumulator,
+        test_agent_runner,
         test_core_without_qt,
         test_version,
         test_audio_helpers,

@@ -19,13 +19,62 @@ class DeepSeekError(RuntimeError):
 
 
 @dataclass
-class StreamEvent:
-    """Один кусочек ответа: текст, рассуждение, статистика токенов или причина остановки."""
+class ToolCall:
+    """Запрошенный моделью вызов инструмента."""
 
-    kind: str  # content | reasoning | usage | finish
+    id: str
+    name: str
+    arguments: str
+
+
+@dataclass
+class StreamEvent:
+    """Один кусочек ответа: текст, рассуждение, инструмент, статистика или стоп."""
+
+    kind: str  # content | reasoning | tool_call | usage | finish
     text: str = ""
     usage: dict | None = None
     finish_reason: str | None = None
+    tool_call: ToolCall | None = None
+
+
+class ToolCallAccumulator:
+    """Склеивает фрагменты `delta.tool_calls`: они приходят по частям, по index."""
+
+    def __init__(self) -> None:
+        self._items: dict[int, dict] = {}
+
+    def feed(self, deltas) -> None:
+        for delta in deltas or []:
+            index = int(getattr(delta, "index", 0) or 0)
+            item = self._items.setdefault(
+                index, {"id": "", "name": "", "arguments": ""}
+            )
+            call_id = getattr(delta, "id", None)
+            if call_id:
+                item["id"] = str(call_id)
+            function = getattr(delta, "function", None)
+            if function is None:
+                continue
+            name = getattr(function, "name", None)
+            if name:
+                item["name"] += str(name)
+            arguments = getattr(function, "arguments", None)
+            if arguments:
+                item["arguments"] += str(arguments)
+
+    def finish(self) -> list[ToolCall]:
+        calls: list[ToolCall] = []
+        for index in sorted(self._items):
+            item = self._items[index]
+            calls.append(
+                ToolCall(
+                    id=item["id"] or f"call_{index}",
+                    name=item["name"],
+                    arguments=item["arguments"] or "{}",
+                )
+            )
+        return calls
 
 
 class DeepSeekClient:
@@ -67,8 +116,16 @@ class DeepSeekClient:
             thinking=self.thinking if thinking is None else thinking,
         )
 
-    def stream_chat(self, messages: list[dict]) -> Iterator[StreamEvent]:
-        """Стримим ответ. Ошибки приводим к DeepSeekError."""
+    def stream_chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+    ) -> Iterator[StreamEvent]:
+        """Стримим ответ. Ошибки приводим к DeepSeekError.
+
+        Если передан `tools`, модель может попросить инструменты: в конце
+        потока отдаём готовые `tool_call`-события.
+        """
         params: dict = {
             "model": self.model,
             "messages": messages,
@@ -76,10 +133,13 @@ class DeepSeekClient:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
+        if tools:
+            params["tools"] = tools
         if self.thinking:
             # Включаем режим рассуждений (deepseek-flash / deepseek-v4-pro).
             params["extra_body"] = {"thinking": {"type": "enabled"}}
 
+        accumulator = ToolCallAccumulator()
         try:
             stream = self._client.chat.completions.create(**params)
             for chunk in stream:
@@ -91,11 +151,18 @@ class DeepSeekClient:
                 if choice.finish_reason:
                     yield StreamEvent(kind="finish", finish_reason=choice.finish_reason)
                 delta = choice.delta
+                if delta is None:
+                    continue
                 reasoning = getattr(delta, "reasoning_content", None)
                 if reasoning:
                     yield StreamEvent(kind="reasoning", text=reasoning)
+                tool_deltas = getattr(delta, "tool_calls", None)
+                if tool_deltas:
+                    accumulator.feed(tool_deltas)
                 if delta.content:
                     yield StreamEvent(kind="content", text=delta.content)
+            for call in accumulator.finish():
+                yield StreamEvent(kind="tool_call", tool_call=call)
         except openai.AuthenticationError as exc:
             raise DeepSeekError(
                 "DeepSeek отклонил ключ (401). Проверьте DEEPSEEK_API_KEY в .env."
