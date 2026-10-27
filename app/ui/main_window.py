@@ -39,12 +39,15 @@ from PySide6.QtWidgets import (
 from app import __version__
 from app.agent import (
     AgentLimits,
+    McpLimits,
+    McpSession,
     ToolContext,
     WebLimits,
     WebSession,
     Workspace,
     build_agent_prompt,
     build_messages,
+    mcp_servers_from_settings,
     probe_chrome,
     validate_root,
 )
@@ -81,11 +84,13 @@ from app.personas import (
 )
 from app.tts import SpeechPipeline, TTSService, voice_label
 from app.ui.level_meter import LevelMeter
+from app.ui.mcp_dialog import McpServerDialog
 from app.ui.mic_dialog import MicDialog
 from app.ui.persona_dialog import PersonaDialog
 from app.ui.workers import (
     AgentWorker,
     ChatWorker,
+    McpProbeWorker,
     PrepareWorker,
     SpeakWorker,
     SpeechSignals,
@@ -168,6 +173,9 @@ class MainWindow(QMainWindow):
         self._chat_worker: ChatWorker | AgentWorker | None = None
         self._speak_worker: SpeakWorker | None = None
         self._voice_worker: VoiceListWorker | None = None
+        self._mcp_session: McpSession | None = None
+        self._mcp_probe_worker: McpProbeWorker | None = None
+        self._mcp_populating = False
         self._pipeline: SpeechPipeline | None = None
 
         # --- микрофон и распознавание ---
@@ -579,6 +587,50 @@ class MainWindow(QMainWindow):
         self.agent_web_check.toggled.connect(self._on_agent_web)
         agent_layout.addWidget(self.agent_web_check)
 
+        self.agent_mcp_check = QCheckBox("MCP-серверы (внешние инструменты)")
+        self.agent_mcp_check.setToolTip(
+            "Разрешить агенту вызывать инструменты MCP-серверов из config.json.\n"
+            "MCP-сервер — отдельная программа на вашем компьютере: папками агента\n"
+            "она не ограничена и может менять данные. Запускайте только доверенные.\n"
+            "Серверы подключаются при следующем вопросе, в фоне."
+        )
+        self.agent_mcp_check.toggled.connect(self._on_agent_mcp)
+        agent_layout.addWidget(self.agent_mcp_check)
+
+        self.agent_mcp_servers = QListWidget()
+        self.agent_mcp_servers.setMaximumHeight(92)
+        self.agent_mcp_servers.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.agent_mcp_servers.setToolTip(
+            "Галочка — сервер включён. Двойной щелчок — изменить."
+        )
+        self.agent_mcp_servers.itemChanged.connect(self._on_mcp_item_changed)
+        self.agent_mcp_servers.currentRowChanged.connect(
+            lambda _row: self._sync_mcp_buttons()
+        )
+        self.agent_mcp_servers.itemDoubleClicked.connect(
+            lambda _item: self._edit_mcp_server()
+        )
+        agent_layout.addWidget(self.agent_mcp_servers)
+
+        mcp_buttons = QHBoxLayout()
+        self.add_mcp_server_button = QPushButton("Добавить…")
+        self.add_mcp_server_button.clicked.connect(self._add_mcp_server)
+        self.edit_mcp_server_button = QPushButton("Изменить…")
+        self.edit_mcp_server_button.clicked.connect(self._edit_mcp_server)
+        self.remove_mcp_server_button = QPushButton("Удалить")
+        self.remove_mcp_server_button.clicked.connect(self._remove_mcp_server)
+        mcp_buttons.addWidget(self.add_mcp_server_button)
+        mcp_buttons.addWidget(self.edit_mcp_server_button)
+        mcp_buttons.addWidget(self.remove_mcp_server_button)
+        agent_layout.addLayout(mcp_buttons)
+
+        self.probe_mcp_server_button = QPushButton("Проверить сервер…")
+        self.probe_mcp_server_button.setToolTip(
+            "Запустить выбранный сервер и показать, сколько инструментов он отдал."
+        )
+        self.probe_mcp_server_button.clicked.connect(self._probe_mcp_server)
+        agent_layout.addWidget(self.probe_mcp_server_button)
+
         self.agent_roots = QListWidget()
         self.agent_roots.setMaximumHeight(92)
         self.agent_roots.setTextElideMode(Qt.TextElideMode.ElideMiddle)
@@ -675,7 +727,9 @@ class MainWindow(QMainWindow):
             self.persona_combo,
             self.agent_read_check,
             self.agent_web_check,
+            self.agent_mcp_check,
             self.agent_rounds_spin,
+            self.agent_mcp_servers,
         ):
             widget.blockSignals(True)
         self.model_combo.setCurrentText(
@@ -688,6 +742,7 @@ class MainWindow(QMainWindow):
         self.thinking_check.setChecked(bool(model.thinking))
         self.agent_read_check.setChecked(bool(self.settings.agent.read_enabled))
         self.agent_web_check.setChecked(bool(self.settings.agent.web_enabled))
+        self.agent_mcp_check.setChecked(bool(self.settings.agent.mcp_enabled))
         self.agent_rounds_spin.setValue(int(self.settings.agent.max_rounds))
         for widget in (
             self.model_combo,
@@ -696,7 +751,9 @@ class MainWindow(QMainWindow):
             self.persona_combo,
             self.agent_read_check,
             self.agent_web_check,
+            self.agent_mcp_check,
             self.agent_rounds_spin,
+            self.agent_mcp_servers,
         ):
             widget.blockSignals(False)
 
@@ -751,6 +808,8 @@ class MainWindow(QMainWindow):
 
         self._populate_agent_roots()
         self._sync_agent_buttons()
+        self._populate_mcp_servers()
+        self._sync_mcp_buttons()
         self._refresh_agent_ui()
 
     def _touch(self) -> None:
@@ -773,6 +832,160 @@ class MainWindow(QMainWindow):
 
     def _sync_agent_buttons(self) -> None:
         self.remove_agent_root_button.setEnabled(self.agent_roots.currentRow() >= 0)
+
+    # --- MCP -------------------------------------------------------------
+    def _populate_mcp_servers(self) -> None:
+        self._mcp_populating = True
+        try:
+            self.agent_mcp_servers.clear()
+            for server in self.settings.agent.mcp_servers:
+                if not isinstance(server, dict):
+                    continue
+                args = " ".join(str(part) for part in (server.get("args") or []))
+                command = " ".join(
+                    part
+                    for part in (str(server.get("command") or ""), args)
+                    if part
+                )
+                item = QListWidgetItem(f"{server.get('id')} — {command}")
+                item.setToolTip(command)
+                item.setData(Qt.ItemDataRole.UserRole, str(server.get("id") or ""))
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                enabled = bool(server.get("enabled", True))
+                item.setCheckState(
+                    Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked
+                )
+                self.agent_mcp_servers.addItem(item)
+        finally:
+            self._mcp_populating = False
+
+    def _sync_mcp_buttons(self) -> None:
+        row = self.agent_mcp_servers.currentRow()
+        has = 0 <= row < len(self.settings.agent.mcp_servers)
+        self.edit_mcp_server_button.setEnabled(has)
+        self.remove_mcp_server_button.setEnabled(has)
+        self.probe_mcp_server_button.setEnabled(has)
+
+    def _mcp_server_at(self, row: int) -> dict | None:
+        servers = self.settings.agent.mcp_servers
+        if 0 <= row < len(servers) and isinstance(servers[row], dict):
+            return servers[row]
+        return None
+
+    def _on_mcp_item_changed(self, item: QListWidgetItem) -> None:
+        if self._mcp_populating:
+            return
+        server = self._mcp_server_at(self.agent_mcp_servers.row(item))
+        if server is None:
+            return
+        server["enabled"] = item.checkState() == Qt.CheckState.Checked
+        self._touch()
+        self._refresh_agent_ui()
+
+    def _on_agent_mcp(self, enabled: bool) -> None:
+        self.settings.agent.mcp_enabled = bool(enabled)
+        self._touch()
+        self._refresh_agent_ui()
+
+    def _after_mcp_change(self, message: str) -> None:
+        self._populate_mcp_servers()
+        self._sync_mcp_buttons()
+        self._refresh_agent_ui()
+        self._touch()
+        self.statusBar().showMessage(message, 4000)
+
+    def _add_mcp_server(self) -> None:
+        dialog = McpServerDialog(parent=self, create=True)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        server = dialog.result_server()
+        if server is None:
+            return
+        existing = {
+            str(item.get("id") or "").casefold()
+            for item in self.settings.agent.mcp_servers
+            if isinstance(item, dict)
+        }
+        if server["id"].casefold() in existing:
+            QMessageBox.warning(
+                self, "MCP", f"Сервер с id «{server['id']}» уже есть."
+            )
+            return
+        self.settings.agent.mcp_servers.append(server)
+        self._after_mcp_change(f"Сервер добавлен: {server['id']}")
+
+    def _edit_mcp_server(self) -> None:
+        row = self.agent_mcp_servers.currentRow()
+        server = self._mcp_server_at(row)
+        if server is None:
+            return
+        dialog = McpServerDialog(server, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        updated = dialog.result_server()
+        if updated is None:
+            return
+        existing = {
+            str(item.get("id") or "").casefold()
+            for index, item in enumerate(self.settings.agent.mcp_servers)
+            if index != row and isinstance(item, dict)
+        }
+        if updated["id"].casefold() in existing:
+            QMessageBox.warning(
+                self, "MCP", f"Сервер с id «{updated['id']}» уже есть."
+            )
+            return
+        self.settings.agent.mcp_servers[row] = updated
+        self._after_mcp_change(f"Сервер изменён: {updated['id']}")
+
+    def _remove_mcp_server(self) -> None:
+        row = self.agent_mcp_servers.currentRow()
+        server = self._mcp_server_at(row)
+        if server is None:
+            return
+        removed = self.settings.agent.mcp_servers.pop(row)
+        self._after_mcp_change(f"Сервер убран: {removed.get('id')}")
+        if self.settings.agent.mcp_servers:
+            self.agent_mcp_servers.setCurrentRow(
+                min(row, self.agent_mcp_servers.count() - 1)
+            )
+        self._sync_mcp_buttons()
+
+    def _probe_mcp_server(self) -> None:
+        server = self._mcp_server_at(self.agent_mcp_servers.currentRow())
+        if server is None:
+            return
+        if self._is_running(self._mcp_probe_worker):
+            self.statusBar().showMessage("Проверка сервера уже идёт…", 3000)
+            return
+        worker = McpProbeWorker(
+            dict(server), McpLimits.from_settings(self.settings.agent), self
+        )
+        worker.done.connect(self._on_mcp_probe_done)
+        worker.failed.connect(self._on_mcp_probe_failed)
+        worker.finished.connect(self._forget_mcp_probe)
+        worker.finished.connect(worker.deleteLater)
+        self._mcp_probe_worker = worker
+        self.statusBar().showMessage(f"MCP: запускаю «{server.get('id')}»…")
+        worker.start()
+
+    def _on_mcp_probe_done(self, server_id: str, names: list) -> None:
+        preview = ", ".join(str(name) for name in names[:8])
+        if len(names) > 8:
+            preview += " …"
+        self.statusBar().showMessage(
+            f"MCP «{server_id}»: инструментов {len(names)} — {preview}", 10000
+        )
+
+    def _on_mcp_probe_failed(self, server_id: str, reason: str) -> None:
+        QMessageBox.warning(
+            self,
+            "MCP",
+            f"Сервер «{server_id}» не прошёл проверку:\n{reason}",
+        )
+
+    def _forget_mcp_probe(self) -> None:
+        self._mcp_probe_worker = None
 
     def _refresh_agent_ui(self) -> None:
         agent = self.settings.agent
@@ -807,9 +1020,26 @@ class MainWindow(QMainWindow):
             else:
                 parts.append("Интернет: поиск и страницы. " + hint)
 
+        if agent.mcp_enabled:
+            servers = [
+                item for item in agent.mcp_servers if isinstance(item, dict)
+            ]
+            enabled = [item for item in servers if item.get("enabled", True)]
+            if not servers:
+                parts.append(
+                    "MCP: включён, но серверы не заданы — добавьте сервер в списке."
+                )
+            elif not enabled:
+                parts.append(f"MCP: серверов — {len(servers)}, все выключены.")
+            else:
+                parts.append(
+                    f"MCP: серверов — {len(servers)}, включено — {len(enabled)}. "
+                    "Подключатся при следующем вопросе."
+                )
+
         if not parts:
             parts.append(
-                "Агент выключен: включите «Чтение файлов» и/или «Интернет»."
+                "Агент выключен: включите «Чтение файлов», «Интернет» и/или «MCP»."
             )
         self.agent_hint.setText("\n".join(parts))
 
@@ -894,9 +1124,14 @@ class MainWindow(QMainWindow):
         agent = self.settings.agent
         workspace = self._agent_workspace()
         web = WebSession(WebLimits.from_settings(agent)) if agent.web_enabled else None
-        if workspace is None and web is None:
+        servers = mcp_servers_from_settings(agent) if agent.mcp_enabled else []
+        mcp = (
+            McpSession(servers, McpLimits.from_settings(agent)) if servers else None
+        )
+        if workspace is None and web is None and mcp is None:
             return None
-        return ToolContext(workspace=workspace, web=web)
+        self._mcp_session = mcp
+        return ToolContext(workspace=workspace, web=web, mcp=mcp)
 
     def _on_model_changed(self, name: str) -> None:
         self.settings.model.name = name
@@ -2014,6 +2249,7 @@ class MainWindow(QMainWindow):
                 context.workspace,
                 limits,
                 context.web.limits if context.web is not None else None,
+                context.mcp.server_ids if context.mcp is not None else (),
             )
         trimmed = build_messages(
             system_prompt,
@@ -2112,7 +2348,7 @@ class MainWindow(QMainWindow):
             if rounds:
                 extra += f" · шагов {rounds}"
             if tool_calls:
-                extra += f", чтений {tool_calls}"
+                extra += f", вызовов {tool_calls}"
             self.tokens_label.setText(
                 f"токены: {usage.get('total_tokens', 0)} "
                 f"(вход {usage.get('prompt_tokens', 0)} / "
@@ -2313,6 +2549,13 @@ class MainWindow(QMainWindow):
             app.removeEventFilter(self)
         self._stop_pipeline(wait=True)
         self._stop_thread(self._chat_worker, 3000)
+        if self._mcp_session is not None:
+            try:
+                self._mcp_session.close()
+            except Exception:  # закрытие не должно мешать выходу
+                pass
+            self._mcp_session = None
+        self._stop_thread(self._mcp_probe_worker, 3000)
         self._stop_thread(self._transcribe_worker, 3000)
         self._stop_thread(self._prepare_worker, 3000)
         self._persist()

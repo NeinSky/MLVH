@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from app.agent.policy import ToolError, Workspace
 
-if TYPE_CHECKING:  # web.py — только stdlib, но импорт держим ленивым
+if TYPE_CHECKING:  # web.py и mcp.py — только stdlib, но импорт держим ленивым
+    from app.agent.mcp import McpSession
     from app.agent.web import WebSession
 
 CAPABILITY_FILES = "files"
@@ -27,10 +28,11 @@ class ToolResult:
 
 @dataclass
 class ToolContext:
-    """Что доступно инструментам: файлы, интернет и признак отмены."""
+    """Что доступно инструментам: файлы, интернет, MCP и признак отмены."""
 
     workspace: Workspace | None = None
     web: "WebSession | None" = None
+    mcp: "McpSession | None" = None
     should_stop: Callable[[], bool] | None = None
 
 
@@ -375,18 +377,30 @@ _SCHEMAS: dict[str, dict] = {
 }
 
 
-def tool_schemas(*, files: bool = True, web: bool = False) -> list[dict]:
-    """Схемы только разрешённых возможностей: модели не предлагаем лишнего."""
+def tool_schemas(
+    *,
+    files: bool = True,
+    web: bool = False,
+    extra: list[dict] | None = None,
+) -> list[dict]:
+    """Схемы только разрешённых возможностей: модели не предлагаем лишнего.
+
+    `extra` — готовые схемы внешних инструментов (MCP): они уже отфильтрованы
+    по включённым серверам, поэтому добавляются как есть.
+    """
     allowed: set[str] = set()
     if files:
         allowed.add(CAPABILITY_FILES)
     if web:
         allowed.add(CAPABILITY_WEB)
-    return [
+    result = [
         schema
         for name, schema in _SCHEMAS.items()
         if _CAPABILITIES.get(name) in allowed
     ]
+    if extra:
+        result.extend(item for item in extra if isinstance(item, dict))
+    return result
 
 
 def tool_names(*, files: bool = True, web: bool = False) -> tuple[str, ...]:
@@ -410,10 +424,14 @@ def call_tool(
         ctx.should_stop = should_stop
 
     handler = _HANDLERS.get(name)
-    if handler is None:
-        available = tool_names(
-            files=ctx.workspace is not None, web=ctx.web is not None
+    mcp = ctx.mcp
+    mcp_owned = handler is None and mcp is not None and mcp.owns(name)
+    if handler is None and not mcp_owned:
+        available = list(
+            tool_names(files=ctx.workspace is not None, web=ctx.web is not None)
         )
+        if mcp is not None:
+            available.extend(mcp.names())
         return ToolResult(
             content=f"Ошибка: неизвестный инструмент «{name}». Доступны: "
             + ", ".join(available or ("— нет —",)),
@@ -437,6 +455,13 @@ def call_tool(
         )
 
     try:
+        if mcp_owned:
+            mcp_result = mcp.call(name, args, ctx.should_stop)  # type: ignore[union-attr]
+            return ToolResult(
+                content=mcp_result.content,
+                summary=mcp_result.summary,
+                ok=mcp_result.ok,
+            )
         return handler(ctx, args)
     except ToolError as exc:
         return ToolResult(

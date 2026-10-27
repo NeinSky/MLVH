@@ -82,6 +82,11 @@ def main() -> int:
         help="разрешить интернет на один запуск, даже если в настройках выключено",
     )
     parser.add_argument(
+        "--mcp",
+        action="store_true",
+        help="разрешить MCP-серверы из config.json на один запуск",
+    )
+    parser.add_argument(
         "--allow-local-url",
         action="store_true",
         help="для проверок: разрешить локальные адреса (127.0.0.1) в --ask",
@@ -255,12 +260,15 @@ def _ask(text: str, settings: Settings, args) -> int:
     from app.agent import (
         AgentLimits,
         AgentRunner,
+        McpLimits,
+        McpSession,
         ToolContext,
         WebLimits,
         WebSession,
         Workspace,
         build_agent_prompt,
         build_messages,
+        mcp_servers_from_settings,
     )
     from app.deepseek_client import DeepSeekClient, DeepSeekError
 
@@ -296,9 +304,20 @@ def _ask(text: str, settings: Settings, args) -> int:
         else None
     )
 
+    mcp_servers = (
+        mcp_servers_from_settings(settings.agent)
+        if (args.mcp or settings.agent.mcp_enabled)
+        else []
+    )
+    mcp = (
+        McpSession(mcp_servers, McpLimits.from_settings(settings.agent))
+        if mcp_servers
+        else None
+    )
+
     context = (
-        ToolContext(workspace=workspace, web=web)
-        if workspace is not None or web is not None
+        ToolContext(workspace=workspace, web=web, mcp=mcp)
+        if workspace is not None or web is not None or mcp is not None
         else None
     )
 
@@ -309,6 +328,7 @@ def _ask(text: str, settings: Settings, args) -> int:
             context.workspace,
             limits,
             context.web.limits if context.web is not None else None,
+            context.mcp.server_ids if context.mcp is not None else (),
         )
 
     trimmed = build_messages(
@@ -354,18 +374,18 @@ def _ask(text: str, settings: Settings, args) -> int:
         streamed = True
         print(chunk, end="", flush=True)
 
-    runner = AgentRunner(
-        client,
-        trimmed.messages,
-        context,
-        limits,
-        context_tokens=model.context_tokens,
-        max_tokens=max_tokens,
-        on_content=on_content,
-        on_note=on_note,
-        on_tool=on_tool,
-    )
     try:
+        runner = AgentRunner(
+            client,
+            trimmed.messages,
+            context,
+            limits,
+            context_tokens=model.context_tokens,
+            max_tokens=max_tokens,
+            on_content=on_content,
+            on_note=on_note,
+            on_tool=on_tool,
+        )
         reply = runner.run()
     except DeepSeekError as exc:
         print(f"\nОшибка: {exc}")
@@ -373,6 +393,8 @@ def _ask(text: str, settings: Settings, args) -> int:
     finally:
         if web is not None:
             web.close()
+        if mcp is not None:
+            mcp.close()
 
     if reply is None:
         print("\nОстановлено.")

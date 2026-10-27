@@ -144,9 +144,66 @@ def _as_bool_value(value: object) -> bool:
     return bool(value)
 
 
+def _normalize_mcp_servers(raw: object) -> list[dict]:
+    """MCP-серверы из конфига: только известные поля, битые записи пропускаем."""
+    if not isinstance(raw, list):
+        return []
+    servers: list[dict] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            print("[config] MCP-сервер пропущен: запись должна быть объектом.")
+            continue
+
+        server_id = str(item.get("id") or "").strip()
+        command = str(item.get("command") or "").strip()
+        if not server_id or not command:
+            print("[config] MCP-сервер пропущен: нужны id и command.")
+            continue
+        key = server_id.casefold()
+        if key in seen:
+            print(f"[config] MCP-сервер «{server_id}» пропущен: id повторяется.")
+            continue
+        seen.add(key)
+
+        raw_args = item.get("args")
+        if isinstance(raw_args, str):
+            args = raw_args.split()
+        elif isinstance(raw_args, (list, tuple)):
+            args = [str(part) for part in raw_args]
+        else:
+            args = []
+
+        env: dict[str, str] = {}
+        raw_env = item.get("env")
+        if isinstance(raw_env, dict):
+            for env_key, env_value in raw_env.items():
+                env_key = str(env_key).strip()
+                if env_key:
+                    env[env_key] = str(env_value)
+
+        try:
+            timeout = int(item.get("timeout") or 0)
+        except (TypeError, ValueError):
+            timeout = 0
+
+        servers.append(
+            {
+                "id": server_id,
+                "command": command,
+                "args": args,
+                "env": env,
+                "cwd": str(item.get("cwd") or "").strip(),
+                "enabled": _as_bool_value(item.get("enabled", True)),
+                "timeout": max(0, min(600, timeout)),
+            }
+        )
+    return servers
+
+
 @dataclass
 class AgentSettings:
-    """Права и пределы агента: чтение файлов и интернет."""
+    """Права и пределы агента: чтение файлов, интернет и MCP-серверы."""
 
     read_enabled: bool = False          # право «Чтение»: галочка в разделе «Агент»
     roots: list[str] = field(default_factory=list)   # рабочие папки (абсолютные пути)
@@ -169,6 +226,11 @@ class AgentSettings:
     web_proxy: str = "auto"             # auto / system / direct / http://host:port
     web_allow_local: bool = False       # только для проверок на локальном сервере
     chrome_path: str = ""               # пусто — ищем Chrome сами
+    # --- MCP: внешние инструменты через stdio ---
+    mcp_enabled: bool = False           # право «MCP»: галочка в разделе «Агент»
+    mcp_servers: list[dict] = field(default_factory=list)  # описания серверов
+    mcp_timeout: int = 60               # секунд на один tools/call
+    mcp_start_timeout: int = 120        # секунд на запуск и рукопожатие
 
     @classmethod
     def from_dict(cls, data: dict) -> "AgentSettings":
@@ -178,6 +240,12 @@ class AgentSettings:
         settings.web_enabled = _as_bool_value(settings.web_enabled)
         settings.web_allow_local = _as_bool_value(settings.web_allow_local)
         settings.chrome_path = str(settings.chrome_path or "").strip()
+        settings.mcp_enabled = _as_bool_value(settings.mcp_enabled)
+        settings.mcp_servers = _normalize_mcp_servers(settings.mcp_servers)
+        settings.mcp_timeout = _clamp_int(settings.mcp_timeout, 60, 5, 600)
+        settings.mcp_start_timeout = _clamp_int(
+            settings.mcp_start_timeout, 120, 5, 600
+        )
 
         roots: list[str] = []
         raw_roots = settings.roots if isinstance(settings.roots, list) else []
@@ -411,6 +479,10 @@ class Settings:
                 "web_proxy": self.agent.web_proxy,
                 "web_allow_local": self.agent.web_allow_local,
                 "chrome_path": self.agent.chrome_path,
+                "mcp_enabled": self.agent.mcp_enabled,
+                "mcp_servers": [dict(item) for item in self.agent.mcp_servers],
+                "mcp_timeout": self.agent.mcp_timeout,
+                "mcp_start_timeout": self.agent.mcp_start_timeout,
             },
             "system_prompt": self.system_prompt,
             "active_persona": self.active_persona,

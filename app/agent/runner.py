@@ -72,14 +72,19 @@ class AgentRunner:
             if isinstance(context, ToolContext)
             else ToolContext(workspace=context)
         )
-        self._tools = tool_schemas(
-            files=self._context.workspace is not None,
-            web=self._context.web is not None,
-        )
         self._limits = limits
         self._budget = context_budget(context_tokens, max_tokens)
         self._cancel = cancel or threading.Event()
         self._clock = clock
+        mcp = self._context.mcp
+        # MCP-серверы стартуют здесь, в рабочем потоке. Отмена проверяется
+        # при ожидании рукопожатия, чтобы закрытие окна не ждало npx.
+        mcp_schemas = mcp.schemas(self._cancel.is_set) if mcp is not None else None
+        self._tools = tool_schemas(
+            files=self._context.workspace is not None,
+            web=self._context.web is not None,
+            extra=mcp_schemas,
+        )
         self._on_content = on_content or (lambda _text: None)
         self._on_reasoning = on_reasoning or (lambda _text: None)
         self._on_note = on_note or (lambda _text: None)
@@ -169,6 +174,10 @@ class AgentRunner:
     def run(self) -> AgentReply | None:
         """Возвращает AgentReply или None, если пользователь остановил запрос."""
         started = self._clock()
+        mcp = self._context.mcp
+        if mcp is not None:
+            for problem in mcp.problems:
+                self._note(f"MCP: {problem}")
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         rounds = 0
         calls = 0

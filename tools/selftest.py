@@ -131,6 +131,19 @@ def test_settings() -> None:
           settings.agent.web_proxy)
     check("локальная сеть по умолчанию закрыта",
           settings.agent.web_allow_local is False)
+    check("MCP по умолчанию выключен", settings.agent.mcp_enabled is False)
+    check("MCP-серверов по умолчанию нет", settings.agent.mcp_servers == [],
+          str(settings.agent.mcp_servers))
+    check("таймаут MCP по умолчанию — 60 с", settings.agent.mcp_timeout == 60,
+          str(settings.agent.mcp_timeout))
+    check("таймаут запуска MCP по умолчанию — 120 с",
+          settings.agent.mcp_start_timeout == 120,
+          str(settings.agent.mcp_start_timeout))
+    check("MCP-ключи пишутся в конфиг",
+          data["agent"]["mcp_enabled"] is False
+          and data["agent"]["mcp_servers"] == []
+          and data["agent"]["mcp_timeout"] == 60
+          and data["agent"]["mcp_start_timeout"] == 120)
 
     restored = Settings.from_dict(data)
     check("round-trip сохраняет движок", restored.tts.engine == settings.tts.engine)
@@ -204,6 +217,50 @@ def test_settings() -> None:
           legacy.tts.voice == "ru-RU-SvetlanaNeural", legacy.tts.voice)
     check("агент старых конфигов выключен", legacy.agent.read_enabled is False)
 
+    mcp_settings = Settings.from_dict(
+        {
+            "agent": {
+                "mcp_servers": [
+                    {"id": "Demo", "command": "python", "args": "-u server.py"},
+                    {"id": "", "command": "x"},
+                    "bad",
+                    {"id": "demo", "command": "node"},
+                    {
+                        "id": "two",
+                        "command": "node",
+                        "enabled": "нет",
+                        "timeout": 9999,
+                    },
+                ],
+                "mcp_timeout": 1,
+                "mcp_start_timeout": 9999,
+            }
+        }
+    )
+    servers = mcp_settings.agent.mcp_servers
+    check(
+        "MCP-серверы нормализуются",
+        len(servers) == 2
+        and servers[0]["id"] == "Demo"
+        and servers[0]["args"] == ["-u", "server.py"]
+        and servers[0]["enabled"] is True
+        and servers[1]["enabled"] is False
+        and servers[1]["timeout"] == 600,
+        str(servers),
+    )
+    check(
+        "таймауты MCP зажимаются",
+        mcp_settings.agent.mcp_timeout == 5
+        and mcp_settings.agent.mcp_start_timeout == 600,
+        f"{mcp_settings.agent.mcp_timeout}/{mcp_settings.agent.mcp_start_timeout}",
+    )
+    restored_mcp = Settings.from_dict(mcp_settings.to_dict())
+    check(
+        "MCP round-trip сохраняет серверы",
+        restored_mcp.agent.mcp_servers == servers,
+        str(restored_mcp.agent.mcp_servers),
+    )
+
 
 def test_audio_helpers() -> None:
     print("аудио:")
@@ -245,6 +302,14 @@ def test_example_config() -> None:
           and agent.get("web_proxy") == "auto",
           str({key: agent.get(key) for key in ("web_max_searches", "web_max_pages", "web_render", "web_proxy")}))
     check("history_turns убран", "history_turns" not in data)
+    check("MCP в примере выключен", agent.get("mcp_enabled") is False,
+          str(agent.get("mcp_enabled")))
+    check("MCP-серверов в примере нет", agent.get("mcp_servers") == [],
+          str(agent.get("mcp_servers")))
+    check("лимиты MCP в примере",
+          agent.get("mcp_timeout") == 60
+          and agent.get("mcp_start_timeout") == 120,
+          f"{agent.get('mcp_timeout')}/{agent.get('mcp_start_timeout')}")
     ids = [item.get("id") for item in data.get("personas") or [] if isinstance(item, dict)]
     check("активный характер есть в списке", data.get("active_persona") in ids,
           str(data.get("active_persona")))
@@ -773,6 +838,259 @@ def test_agent_web() -> None:
     check("probe Chrome даёт путь или подсказку",
           bool(chrome) != bool(hint), f"{chrome} / {hint}")
 
+def test_agent_mcp() -> None:
+    print("агент: MCP")
+    from app.agent.mcp import McpLimits, McpResult, McpServer, McpSession
+    from app.agent.policy import ToolError
+    from app.agent.tools import ToolContext, call_tool
+
+    script = BASE_DIR / "tools" / "fake_mcp_server.py"
+    check("фейковый MCP-сервер на месте", script.exists(), str(script))
+    if not script.exists():
+        return
+
+    server = McpServer(
+        id="demo",
+        command=sys.executable,
+        args=["-u", str(script)],
+    )
+    session = McpSession(
+        [server], McpLimits(timeout=2, start_timeout=20), log_path=None
+    )
+    try:
+        names = [item["function"]["name"] for item in session.schemas()]
+        check(
+            "инструменты с префиксом и обе страницы tools/list",
+            names
+            == [
+                "mcp_demo_echo",
+                "mcp_demo_fail",
+                "mcp_demo_crash",
+                "mcp_demo_slow",
+                "mcp_demo_image",
+                "mcp_demo_page",
+            ],
+            str(names),
+        )
+        check(
+            "описание с именем сервера",
+            all(
+                item["function"]["description"].startswith("[demo]")
+                for item in session.schemas()
+            ),
+        )
+
+        echo = session.call("mcp_demo_echo", {"text": "сорок два"})
+        check("вызов MCP", echo.ok and "сорок два" in echo.content, echo.content)
+        check("подпись вызова в чат", "MCP demo" in echo.summary, echo.summary)
+
+        failed = session.call("mcp_demo_fail", {})
+        check(
+            "isError — ошибка для модели",
+            not failed.ok and failed.content.startswith("Ошибка:"),
+            failed.content,
+        )
+
+        image = session.call("mcp_demo_image", {})
+        check(
+            "картинка — плейсхолдер без base64",
+            image.ok and "изображение" in image.content and "iVBOR" not in image.content,
+            image.content,
+        )
+
+        try:
+            session.call("mcp_demo_echo", {"text": "x"}, should_stop=lambda: True)
+            check("отмена MCP", False)
+        except ToolError:
+            check("отмена MCP", True)
+
+        try:
+            session.call("mcp_demo_nope", {})
+            check("неизвестный MCP-инструмент", False)
+        except ToolError:
+            check("неизвестный MCP-инструмент", True)
+
+        crash = session.call("mcp_demo_crash", {})
+        check("падение сервера — ошибка", not crash.ok, crash.content)
+        again = session.call("mcp_demo_echo", {"text": "после падения"})
+        check(
+            "перезапуск после падения",
+            again.ok and "после падения" in again.content,
+            again.content,
+        )
+
+        session.call("mcp_demo_crash", {})
+        dead = session.call("mcp_demo_echo", {"text": "ещё"})
+        check(
+            "лимит перезапусков на вопрос",
+            not dead.ok and "недоступен" in dead.content,
+            dead.content,
+        )
+    finally:
+        session.close()
+    try:
+        session.close()
+        check("повторное закрытие безопасно", True)
+    except Exception as exc:
+        check("повторное закрытие безопасно", False, str(exc))
+
+    slow = McpSession(
+        [server], McpLimits(timeout=0.5, start_timeout=20), log_path=None
+    )
+    try:
+        slow.schemas()
+        timed_out = slow.call("mcp_demo_slow", {"seconds": 1.2})
+        check(
+            "таймаут вызова MCP",
+            not timed_out.ok and "не ответил" in timed_out.content,
+            timed_out.content,
+        )
+    finally:
+        slow.close()
+
+    broken = McpSession(
+        [McpServer(id="broken", command="mlvh-no-such-command-xyz")],
+        McpLimits(timeout=1, start_timeout=5),
+        log_path=None,
+    )
+    try:
+        check("битый сервер не даёт инструментов", broken.schemas() == [])
+        check("причина сбоя записана", bool(broken.problems), str(broken.problems))
+    finally:
+        broken.close()
+
+    class FakeMcp:
+        def owns(self, name):
+            return name == "mcp_fake_echo"
+
+        def names(self):
+            return ("mcp_fake_echo",)
+
+        def call(self, name, arguments, should_stop=None):
+            return McpResult(
+                content="эхо: " + str(arguments.get("text", "")),
+                summary="MCP fake: echo",
+            )
+
+    result = call_tool(
+        "mcp_fake_echo", '{"text": "привет"}', ToolContext(mcp=FakeMcp())
+    )
+    check(
+        "диспетчер инструментов знает MCP",
+        result.ok and "эхо: привет" in result.content,
+        result.content,
+    )
+    missing = call_tool("mcp_fake_nope", "{}", ToolContext(mcp=FakeMcp()))
+    check(
+        "MCP-имена попадают в список доступных",
+        not missing.ok and "mcp_fake_echo" in missing.content,
+        missing.content,
+    )
+
+    from app.agent.context import build_agent_prompt
+    from app.agent.policy import AgentLimits
+    from app.agent.runner import AgentRunner
+    from app.deepseek_client import StreamEvent, ToolCall
+
+    prompt = build_agent_prompt("база", None, AgentLimits(), None, ["demo"])
+    check(
+        "промпт предупреждает про MCP",
+        "demo" in prompt and "могут менять данные" in prompt and "mcp_" in prompt,
+        prompt[-300:],
+    )
+
+    from app.agent.mcp import _result_text, _slug, _tool_part, _unique_tool_name
+
+    used: set[str] = set()
+    long_name = "x" * 80
+    first = _unique_tool_name("mcp_demo", long_name, used)
+    second = _unique_tool_name("mcp_demo", long_name, used)
+    check(
+        "длинные имена обрезаны до 64 и не совпадают",
+        len(first) <= 64 and len(second) <= 64 and first != second,
+        f"{first} / {second}",
+    )
+    check(
+        "плохие символы в имени заменены",
+        _tool_part("a b/c") == "a_b_c" and _slug("My Server!", "x") == "my_server",
+        f"{_tool_part('a b/c')} / {_slug('My Server!', 'x')}",
+    )
+    structured = _result_text({"structuredContent": {"a": 1}})
+    check("structuredContent → JSON", '"a": 1' in structured, structured)
+
+    class FakeClient:
+        model = "fake"
+        max_tokens = 1000
+        thinking = False
+
+        def __init__(self, script):
+            self.script = list(script)
+            self.seen = []
+            self.tools = None
+
+        def stream_chat(self, messages, tools=None):
+            self.seen.append([dict(message) for message in messages])
+            self.tools = tools
+            step = self.script.pop(0) if self.script else []
+            for event in step:
+                yield event
+
+        def clone(self, **_kwargs):
+            return self
+
+    run_session = McpSession(
+        [server], McpLimits(timeout=2, start_timeout=20), log_path=None
+    )
+    try:
+        client = FakeClient(
+            [
+                [
+                    StreamEvent(
+                        kind="tool_call",
+                        tool_call=ToolCall(
+                            "1", "mcp_demo_echo", '{"text": "сорок два"}'
+                        ),
+                    )
+                ],
+                [StreamEvent(kind="content", text="Инструмент ответил: сорок два")],
+            ]
+        )
+        reply = AgentRunner(
+            client,
+            [
+                {"role": "system", "content": "тест"},
+                {"role": "user", "content": "вызови echo"},
+            ],
+            ToolContext(mcp=run_session),
+            AgentLimits(),
+            context_tokens=100_000,
+            max_tokens=1000,
+        ).run()
+        check(
+            "ответ после MCP-вызова",
+            reply is not None and "сорок два" in reply.text,
+            reply.text if reply else "None",
+        )
+        check(
+            "схема MCP ушла в модель",
+            any(
+                item["function"]["name"] == "mcp_demo_echo"
+                for item in (client.tools or [])
+            ),
+            str(client.tools)[:200],
+        )
+        tool_messages = [
+            message for message in client.seen[-1] if message.get("role") == "tool"
+        ]
+        check(
+            "результат MCP в tool-сообщении",
+            bool(tool_messages) and "сорок два" in tool_messages[-1]["content"],
+            str(tool_messages)[:200],
+        )
+    finally:
+        run_session.close()
+
+
 def test_agent_context() -> None:
     print("агент: контекст")
     from app.agent.context import (
@@ -1182,7 +1500,7 @@ def test_core_without_qt() -> None:
         "import app.asr.audio, app.asr.base, app.asr.hotkeys;"
         "import app.asr.wakeword, app.asr.registry;"
         "import app.agent, app.agent.policy, app.agent.context;"
-        "import app.agent.tools, app.agent.runner, app.agent.web;"
+        "import app.agent.tools, app.agent.runner, app.agent.web, app.agent.mcp;"
         "print('PySide6' in sys.modules)"
     )
     try:
@@ -1251,6 +1569,7 @@ def main() -> int:
         test_agent_policy,
         test_agent_tools,
         test_agent_web,
+        test_agent_mcp,
         test_agent_context,
         test_tool_call_accumulator,
         test_agent_runner,

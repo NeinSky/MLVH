@@ -11,7 +11,14 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from app.agent import AgentLimits, AgentRunner, ToolContext
+from app.agent import (
+    AgentLimits,
+    AgentRunner,
+    McpLimits,
+    McpServer,
+    McpSession,
+    ToolContext,
+)
 from app.asr.base import ASREngine, ASRError
 from app.config import ASRSettings, TTSSettings
 from app.deepseek_client import DeepSeekClient, DeepSeekError
@@ -122,20 +129,20 @@ class AgentWorker(QThread):
         self._cancel.set()
 
     def run(self) -> None:
-        runner = AgentRunner(
-            self._client,
-            self._messages,
-            self._context,
-            self._limits,
-            context_tokens=self._context_tokens,
-            max_tokens=self._max_tokens,
-            cancel=self._cancel,
-            on_content=self.chunk.emit,
-            on_reasoning=self.reasoning.emit,
-            on_note=self.note.emit,
-            on_tool=self.tool.emit,
-        )
         try:
+            runner = AgentRunner(
+                self._client,
+                self._messages,
+                self._context,
+                self._limits,
+                context_tokens=self._context_tokens,
+                max_tokens=self._max_tokens,
+                cancel=self._cancel,
+                on_content=self.chunk.emit,
+                on_reasoning=self.reasoning.emit,
+                on_note=self.note.emit,
+                on_tool=self.tool.emit,
+            )
             reply = runner.run()
         except DeepSeekError as exc:
             if not self._cancel.is_set():
@@ -146,7 +153,7 @@ class AgentWorker(QThread):
                 self.failed.emit(f"Ошибка агента: {exc}")
             return
         finally:
-            self._close_web()
+            self._close_context()
 
         if reply is None or self._cancel.is_set():
             return
@@ -158,15 +165,52 @@ class AgentWorker(QThread):
             return
         self.finished_ok.emit(reply.text, reply.usage)
 
-    def _close_web(self) -> None:
-        """Одна сессия на вопрос: после ответа закрываем интернет-ресурсы."""
-        web = self._context.web
-        if web is None:
+    def _close_context(self) -> None:
+        """Одна сессия на вопрос: после ответа закрываем интернет и MCP."""
+        for resource in (self._context.web, self._context.mcp):
+            if resource is None:
+                continue
+            try:
+                resource.close()
+            except Exception:  # закрытие не должно портить ответ
+                pass
+
+
+class McpProbeWorker(QThread):
+    """Проверка одного MCP-сервера: запуск, рукопожатие, список инструментов."""
+
+    done = Signal(str, list)
+    failed = Signal(str, str)
+
+    def __init__(self, server: dict, limits: McpLimits, parent=None) -> None:
+        super().__init__(parent)
+        self._server = dict(server) if isinstance(server, dict) else {}
+        self._limits = limits
+
+    def run(self) -> None:
+        server = McpServer.from_dict(self._server)
+        if server is None:
+            self.failed.emit(
+                str(self._server.get("id") or "MCP"), "нужны id и command"
+            )
             return
+
+        session = McpSession([server], self._limits, log_path=None)
         try:
-            web.close()
-        except Exception:  # закрытие не должно портить ответ
-            pass
+            names = [
+                item["function"]["name"]
+                for item in session.schemas(self.isInterruptionRequested)
+            ]
+            if session.problems:
+                self.failed.emit(server.id, "; ".join(session.problems))
+            elif not names:
+                self.failed.emit(server.id, "сервер не вернул ни одного инструмента")
+            else:
+                self.done.emit(server.id, names)
+        except Exception as exc:  # поток не должен умирать молча
+            self.failed.emit(server.id, str(exc))
+        finally:
+            session.close()
 
 
 class PrepareWorker(QThread):
