@@ -314,7 +314,7 @@ def _agent_live(args) -> int:
     )
     from app.agent.mcp import McpLimits, McpSession
     from app.config import get_api_key, load_settings
-    from app.deepseek_client import ChatClient, LLMError
+    from app.llm_client import ChatClient, LLMError
 
     settings = load_settings()
     model = settings.model

@@ -297,7 +297,7 @@ def _ask(text: str, settings: Settings, args) -> int:
         build_messages,
         mcp_servers_from_settings,
     )
-    from app.deepseek_client import ChatClient, LLMError
+    from app.llm_client import ChatClient, LLMError
 
     model = settings.model
     key = get_api_key(model)

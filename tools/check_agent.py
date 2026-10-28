@@ -56,13 +56,13 @@ class ScriptedClient:
 
 
 def _content(text: str):
-    from app.deepseek_client import StreamEvent
+    from app.llm_client import StreamEvent
 
     return StreamEvent(kind="content", text=text)
 
 
 def _tool(call_id: str, name: str, arguments: str):
-    from app.deepseek_client import StreamEvent, ToolCall
+    from app.llm_client import StreamEvent, ToolCall
 
     return StreamEvent(kind="tool_call", tool_call=ToolCall(call_id, name, arguments))
 
@@ -224,7 +224,7 @@ def _live(args) -> int:
         build_agent_prompt,
     )
     from app.config import get_api_key, load_settings
-    from app.deepseek_client import ChatClient, LLMError
+    from app.llm_client import ChatClient, LLMError
 
     settings = load_settings()
     model = settings.model

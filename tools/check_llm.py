@@ -192,7 +192,7 @@ def _collect(client, messages: list[dict], tools: list[dict] | None = None):
 
 def _failure(func):
     """Выполняем запрос и возвращаем ошибку LLMError (или None, если её нет)."""
-    from app.deepseek_client import LLMError
+    from app.llm_client import LLMError
 
     try:
         func()
@@ -202,7 +202,7 @@ def _failure(func):
 
 
 def _offline() -> int:
-    from app.deepseek_client import ChatClient
+    from app.llm_client import ChatClient
     from app.llm_probe import ProbeError, probe_models
 
     print("Модель: фейковый OpenAI-совместимый сервер")
@@ -336,7 +336,7 @@ def _offline() -> int:
 
 def _live(base_url: str, alias: str) -> int:
     from app.config import get_api_key, load_settings, normalize_base_url
-    from app.deepseek_client import ChatClient, LLMError
+    from app.llm_client import ChatClient, LLMError
     from app.llm_probe import ProbeError, probe_models
 
     settings = load_settings()

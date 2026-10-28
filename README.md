@@ -694,7 +694,7 @@ app/agent/               агент: политика папок, инструм
 app/agent/web.py         интернет: поиск DuckDuckGo, HTML→текст, Chrome для SPA
 app/agent/mcp.py         MCP-клиент: JSON-RPC 2.0 по stdio, tools/list и tools/call
 app/asr/                 распознавание: движки whisper/vosk, запись, хоткеи
-app/deepseek_client.py   клиент модели: OpenAI-совместимый API, стриминг и tools
+app/llm_client.py        клиент модели: OpenAI-совместимый API, стриминг и tools
 app/llm_probe.py         проверка подключения: GET /models, без Qt и ключей в коде
 app/tts.py               edge-tts → mp3 → pygame, чистка markdown, нарезка на фразы
 app/ui/main_window.py    окно на PySide6

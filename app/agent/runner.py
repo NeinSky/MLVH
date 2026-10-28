@@ -11,7 +11,7 @@ from typing import Callable
 from app.agent.context import context_budget, trim_messages
 from app.agent.policy import AgentLimits, Workspace
 from app.agent.tools import ToolContext, call_tool, tool_schemas
-from app.deepseek_client import DeepSeekClient, DeepSeekError, ToolCall
+from app.llm_client import ChatClient, LLMError, ToolCall
 
 def _stop_text(human: str, detail: str) -> str:
     """Понятная причина остановки: не просто «лимит», а какой и сколько."""
@@ -51,7 +51,7 @@ class AgentRunner:
 
     def __init__(
         self,
-        client: DeepSeekClient,
+        client: ChatClient,
         messages: list[dict],
         context: ToolContext | Workspace,
         limits: AgentLimits,
@@ -222,7 +222,7 @@ class AgentRunner:
                 self._note(f"Лимит {human} ({detail}): отвечаю по уже прочитанному.")
                 try:
                     final = self._request(self._final_messages(), None)
-                except DeepSeekError:
+                except LLMError:
                     return self._finish(
                         self._partial_text() or _stop_text(human, detail),
                         usage,
@@ -241,7 +241,7 @@ class AgentRunner:
 
             try:
                 result = self._request(self._current_messages(), self._tools)
-            except DeepSeekError as exc:
+            except LLMError as exc:
                 # Первый запрос не принял tools (например, прокси) — отвечаем без инструментов.
                 if calls == 0:
                     self._note(f"Инструменты недоступны ({exc}); отвечаю без инструментов.")
@@ -274,7 +274,7 @@ class AgentRunner:
                         self._add_usage(usage, result.usage)
                         if result.finish == "length":
                             usage["truncated"] = True
-                    except DeepSeekError:
+                    except LLMError:
                         pass
                     if self._cancel.is_set():
                         return None
@@ -351,7 +351,7 @@ class AgentRunner:
         self,
         messages: list[dict],
         tools: list[dict] | None,
-        client: DeepSeekClient | None = None,
+        client: ChatClient | None = None,
     ) -> _Round:
         client = client or self._client
         parts: list[str] = []

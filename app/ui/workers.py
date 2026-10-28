@@ -1,4 +1,4 @@
-"""Фоновые задачи: запрос к DeepSeek, список голосов, озвучка, распознавание.
+"""Фоновые задачи: запрос к модели, список голосов, озвучка, распознавание.
 
 Qt-интерфейс нельзя блокировать сетью, синтезом и моделями, поэтому всё тяжёлое
 живёт в QThread.
@@ -21,7 +21,7 @@ from app.agent import (
 )
 from app.asr.base import ASREngine, ASRError
 from app.config import ASRSettings, TTSSettings
-from app.deepseek_client import DeepSeekClient, DeepSeekError
+from app.llm_client import ChatClient, LLMError
 from app.llm_probe import ProbeError, probe_models
 from app.tts import TTSError, TTSService
 
@@ -35,7 +35,7 @@ class ChatWorker(QThread):
     finished_ok = Signal(str, dict)
     failed = Signal(str)
 
-    def __init__(self, client: DeepSeekClient, messages: list[dict], parent=None) -> None:
+    def __init__(self, client: ChatClient, messages: list[dict], parent=None) -> None:
         super().__init__(parent)
         self._client = client
         self._messages = messages
@@ -71,12 +71,12 @@ class ChatWorker(QThread):
             if finish == "length":
                 usage["truncated"] = True
             self.finished_ok.emit(text, usage)
-        except DeepSeekError as exc:
+        except LLMError as exc:
             self.failed.emit(str(exc))
         except Exception as exc:  # на всякий случай: поток не должен умирать молча
             self.failed.emit(f"Непредвиденная ошибка: {exc}")
 
-    def _attempt(self, client: DeepSeekClient) -> tuple[str, dict, str | None]:
+    def _attempt(self, client: ChatClient) -> tuple[str, dict, str | None]:
         """Один запрос к модели: собираем текст, статистику и причину остановки."""
         parts: list[str] = []
         usage: dict = {}
@@ -108,7 +108,7 @@ class AgentWorker(QThread):
 
     def __init__(
         self,
-        client: DeepSeekClient,
+        client: ChatClient,
         messages: list[dict],
         context: ToolContext,
         limits: AgentLimits,
@@ -147,7 +147,7 @@ class AgentWorker(QThread):
                 on_tool=self.tool.emit,
             )
             reply = runner.run()
-        except DeepSeekError as exc:
+        except LLMError as exc:
             if not self._cancel.is_set():
                 self.failed.emit(str(exc))
             return

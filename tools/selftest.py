@@ -345,7 +345,7 @@ def test_llm_client() -> None:
     print("клиент модели:")
     from types import SimpleNamespace as NS
 
-    from app.deepseek_client import ChatClient, LLMError, _reasoning_text, _usage_to_dict
+    from app.llm_client import ChatClient, LLMError, _reasoning_text, _usage_to_dict
 
     check("reasoning из reasoning_content",
           _reasoning_text(NS(reasoning_content="раз")) == "раз")
@@ -1285,7 +1285,7 @@ def test_agent_mcp() -> None:
     from app.agent.context import build_agent_prompt
     from app.agent.policy import AgentLimits
     from app.agent.runner import AgentRunner
-    from app.deepseek_client import StreamEvent, ToolCall
+    from app.llm_client import StreamEvent, ToolCall
 
     prompt = build_agent_prompt("база", None, AgentLimits(), None, ["demo"])
     check(
@@ -1508,7 +1508,7 @@ def test_tool_call_accumulator() -> None:
     print("агент: склейка tool_calls")
     from types import SimpleNamespace as NS
 
-    from app.deepseek_client import ToolCallAccumulator
+    from app.llm_client import ToolCallAccumulator
 
     acc = ToolCallAccumulator()
     acc.feed([NS(index=0, id="call_1", function=NS(name="read_file", arguments='{"pa'))])
@@ -1551,7 +1551,7 @@ def test_agent_runner() -> None:
     from app.agent.context import context_budget, estimate_message_tokens
     from app.agent.policy import AgentLimits, Workspace
     from app.agent.runner import AgentRunner
-    from app.deepseek_client import StreamEvent, ToolCall
+    from app.llm_client import StreamEvent, ToolCall
 
     class FakeClient:
         model = "fake"
@@ -1832,7 +1832,7 @@ def test_core_without_qt() -> None:
         "import app.asr.wakeword, app.asr.registry;"
         "import app.agent, app.agent.policy, app.agent.context;"
         "import app.agent.tools, app.agent.runner, app.agent.web, app.agent.mcp;"
-        "import app.llm_probe, app.deepseek_client;"
+        "import app.llm_probe, app.llm_client;"
         "print('PySide6' in sys.modules)"
     )
     try:
