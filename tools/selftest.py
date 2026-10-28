@@ -840,7 +840,13 @@ def test_agent_web() -> None:
 
 def test_agent_mcp() -> None:
     print("агент: MCP")
-    from app.agent.mcp import McpLimits, McpResult, McpServer, McpSession
+    from app.agent.mcp import (
+        McpClient,
+        McpLimits,
+        McpResult,
+        McpServer,
+        McpSession,
+    )
     from app.agent.policy import ToolError
     from app.agent.tools import ToolContext, call_tool
 
@@ -959,6 +965,61 @@ def test_agent_mcp() -> None:
     finally:
         broken.close()
 
+    # Тёплая сессия: окно держит её между вопросами, серверы не стартуют заново.
+    def counting_factory(log: list[str]):
+        class CountingClient(McpClient):
+            def start(self, should_stop=None):
+                log.append(self.server.id)
+                super().start(should_stop)
+
+        return CountingClient
+
+    starts: list[str] = []
+    warm = McpSession(
+        [server],
+        McpLimits(timeout=2, start_timeout=20),
+        log_path=None,
+        client_factory=counting_factory(starts),
+    )
+    try:
+        warm.schemas()
+        first = warm.call("mcp_demo_echo", {"text": "первый"})
+        warm.begin_question()
+        second = warm.call("mcp_demo_echo", {"text": "второй"})
+        check(
+            "тёплая сессия не перезапускает сервер",
+            first.ok and second.ok and starts == ["demo"],
+            f"{starts} / {second.content}",
+        )
+        check("новый вопрос чистит причины сбоев", warm.problems == [], str(warm.problems))
+
+        # Бюджет перезапусков считается на вопрос, а не на всю жизнь сессии.
+        warm.call("mcp_demo_crash", {})
+        revived = warm.call("mcp_demo_echo", {"text": "после падения"})
+        check("падение внутри вопроса — один перезапуск", revived.ok, revived.content)
+        warm.call("mcp_demo_crash", {})
+        dead = warm.call("mcp_demo_echo", {"text": "ещё"})
+        check("бюджет перезапусков исчерпан", not dead.ok, dead.content)
+        warm.begin_question()
+        fresh = warm.call("mcp_demo_echo", {"text": "после нового вопроса"})
+        check("новый вопрос сбрасывает бюджет", fresh.ok, fresh.content)
+
+        # Сервер мог умереть между вопросами: поднимаем его сразу.
+        warm.call("mcp_demo_crash", {})
+        before = len(starts)
+        warm.begin_question()
+        check(
+            "умерший между вопросами сервер поднят заранее",
+            len(starts) > before and not warm.problems,
+            f"{starts} / {warm.problems}",
+        )
+    finally:
+        warm.close()
+    check(
+        "после close сессия не отдаёт инструменты",
+        warm.schemas() == [] and warm.names() == (),
+    )
+
     class FakeMcp:
         def owns(self, name):
             return name == "mcp_fake_echo"
@@ -1038,8 +1099,12 @@ def test_agent_mcp() -> None:
         def clone(self, **_kwargs):
             return self
 
+    run_starts: list[str] = []
     run_session = McpSession(
-        [server], McpLimits(timeout=2, start_timeout=20), log_path=None
+        [server],
+        McpLimits(timeout=2, start_timeout=20),
+        log_path=None,
+        client_factory=counting_factory(run_starts),
     )
     try:
         client = FakeClient(
@@ -1086,6 +1151,38 @@ def test_agent_mcp() -> None:
             "результат MCP в tool-сообщении",
             bool(tool_messages) and "сорок два" in tool_messages[-1]["content"],
             str(tool_messages)[:200],
+        )
+
+        # Второй вопрос в том же окне: сессия тёплая, сервер не стартует заново.
+        client2 = FakeClient([[StreamEvent(kind="content", text="Второй ответ")]])
+        reply2 = AgentRunner(
+            client2,
+            [
+                {"role": "system", "content": "тест"},
+                {"role": "user", "content": "ещё вопрос"},
+            ],
+            ToolContext(mcp=run_session),
+            AgentLimits(),
+            context_tokens=100_000,
+            max_tokens=1000,
+        ).run()
+        check(
+            "второй вопрос по тёплой сессии",
+            reply2 is not None and "Второй ответ" in reply2.text,
+            reply2.text if reply2 else "None",
+        )
+        check(
+            "сервер не перезапущен между вопросами",
+            run_starts == ["demo"],
+            str(run_starts),
+        )
+        check(
+            "схемы MCP доступны на втором вопросе",
+            any(
+                item["function"]["name"] == "mcp_demo_echo"
+                for item in (client2.tools or [])
+            ),
+            str(client2.tools)[:200],
         )
     finally:
         run_session.close()

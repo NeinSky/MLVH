@@ -174,6 +174,7 @@ class MainWindow(QMainWindow):
         self._speak_worker: SpeakWorker | None = None
         self._voice_worker: VoiceListWorker | None = None
         self._mcp_session: McpSession | None = None
+        self._mcp_key: tuple | None = None
         self._mcp_probe_worker: McpProbeWorker | None = None
         self._mcp_populating = False
         self._pipeline: SpeechPipeline | None = None
@@ -879,17 +880,20 @@ class MainWindow(QMainWindow):
         if server is None:
             return
         server["enabled"] = item.checkState() == Qt.CheckState.Checked
+        self._drop_mcp_session()
         self._touch()
         self._refresh_agent_ui()
 
     def _on_agent_mcp(self, enabled: bool) -> None:
         self.settings.agent.mcp_enabled = bool(enabled)
+        self._drop_mcp_session()
         self._touch()
         self._refresh_agent_ui()
 
     def _after_mcp_change(self, message: str) -> None:
         self._populate_mcp_servers()
         self._sync_mcp_buttons()
+        self._drop_mcp_session()
         self._refresh_agent_ui()
         self._touch()
         self.statusBar().showMessage(message, 4000)
@@ -1034,7 +1038,8 @@ class MainWindow(QMainWindow):
             else:
                 parts.append(
                     f"MCP: серверов — {len(servers)}, включено — {len(enabled)}. "
-                    "Подключатся при следующем вопросе."
+                    "Подключатся при следующем вопросе и останутся запущенными, "
+                    "пока не измените настройки."
                 )
 
         if not parts:
@@ -1124,14 +1129,72 @@ class MainWindow(QMainWindow):
         agent = self.settings.agent
         workspace = self._agent_workspace()
         web = WebSession(WebLimits.from_settings(agent)) if agent.web_enabled else None
-        servers = mcp_servers_from_settings(agent) if agent.mcp_enabled else []
-        mcp = (
-            McpSession(servers, McpLimits.from_settings(agent)) if servers else None
-        )
+        if agent.mcp_enabled:
+            mcp = self._mcp_for_question()
+        else:
+            # MCP выключили — тёплые процессы больше не нужны.
+            self._drop_mcp_session()
+            mcp = None
         if workspace is None and web is None and mcp is None:
             return None
-        self._mcp_session = mcp
         return ToolContext(workspace=workspace, web=web, mcp=mcp)
+
+    def _mcp_for_question(self) -> McpSession | None:
+        """Тёплая MCP-сессия окна: серверы не стартуют заново каждый вопрос.
+
+        Пока список серверов и таймауты не менялись, сессия переиспользуется
+        вместе с уже запущенными процессами. После правки настроек старая
+        закрывается, и следующий вопрос поднимает серверы заново.
+        """
+        agent = self.settings.agent
+        servers = mcp_servers_from_settings(agent)
+        if not servers:
+            self._drop_mcp_session()
+            return None
+        key = self._mcp_config_key(servers, agent)
+        if self._mcp_session is None or self._mcp_key != key:
+            self._drop_mcp_session()
+            self._mcp_session = McpSession(servers, McpLimits.from_settings(agent))
+            self._mcp_key = key
+        return self._mcp_session
+
+    @staticmethod
+    def _mcp_config_key(servers, agent) -> tuple:
+        """Всё, из-за чего тёплые процессы не подходят: состав и таймауты."""
+        return (
+            tuple(
+                (
+                    server.id,
+                    server.command,
+                    tuple(server.args),
+                    tuple(sorted(server.env.items())),
+                    server.cwd,
+                    server.enabled,
+                    server.timeout,
+                )
+                for server in servers
+            ),
+            agent.mcp_timeout,
+            agent.mcp_start_timeout,
+        )
+
+    def _drop_mcp_session(self) -> None:
+        """Закрыть тёплую сессию; во время вопроса — только пометить на замену.
+
+        Пока идёт запрос, сессией пользуется рабочий поток: закрывать её
+        из интерфейса нельзя. Ключ сбрасывается, и следующий вопрос
+        начнёт с новой сессии, а старую закроет тогда же.
+        """
+        self._mcp_key = None
+        if self._mcp_session is None:
+            return
+        if self._is_running(self._chat_worker):
+            return
+        session, self._mcp_session = self._mcp_session, None
+        try:
+            session.close()
+        except Exception:  # закрытие не должно мешать работе окна
+            pass
 
     def _on_model_changed(self, name: str) -> None:
         self.settings.model.name = name
@@ -2288,6 +2351,7 @@ class MainWindow(QMainWindow):
                 limits,
                 context_tokens=model.context_tokens,
                 max_tokens=max_tokens,
+                close_mcp=False,  # сессией MCP владеет окно: серверы остаются тёплыми
                 parent=self,
             )
             worker.tool.connect(self._on_agent_tool)
@@ -2549,12 +2613,14 @@ class MainWindow(QMainWindow):
             app.removeEventFilter(self)
         self._stop_pipeline(wait=True)
         self._stop_thread(self._chat_worker, 3000)
-        if self._mcp_session is not None:
+        # Окно владеет тёплой MCP-сессией: закрываем её последней, после потока.
+        session, self._mcp_session = self._mcp_session, None
+        self._mcp_key = None
+        if session is not None:
             try:
-                self._mcp_session.close()
+                session.close()
             except Exception:  # закрытие не должно мешать выходу
                 pass
-            self._mcp_session = None
         self._stop_thread(self._mcp_probe_worker, 3000)
         self._stop_thread(self._transcribe_worker, 3000)
         self._stop_thread(self._prepare_worker, 3000)

@@ -79,7 +79,12 @@ class AgentRunner:
         mcp = self._context.mcp
         # MCP-серверы стартуют здесь, в рабочем потоке. Отмена проверяется
         # при ожидании рукопожатия, чтобы закрытие окна не ждало npx.
-        mcp_schemas = mcp.schemas(self._cancel.is_set) if mcp is not None else None
+        # Сессия может быть тёплой (живёт в окне), поэтому каждый вопрос
+        # начинает со свежим счётом сбоев и перезапусков.
+        mcp_schemas = None
+        if mcp is not None:
+            mcp.begin_question(self._cancel.is_set)
+            mcp_schemas = mcp.schemas(self._cancel.is_set)
         self._tools = tool_schemas(
             files=self._context.workspace is not None,
             web=self._context.web is not None,

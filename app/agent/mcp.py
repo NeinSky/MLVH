@@ -264,6 +264,12 @@ class McpClient:
         return self._broken
 
     @property
+    def alive(self) -> bool:
+        """Процесс ещё работает: `broken` выставляется только при сбое запроса."""
+        process = self._process
+        return process is not None and process.poll() is None
+
+    @property
     def protocol(self) -> str:
         return self._protocol
 
@@ -739,11 +745,15 @@ def _unique_tool_name(prefix: str, tool_name: str, used: set[str]) -> str:
 
 
 class McpSession:
-    """Серверы MCP на один вопрос агента: схемы, вызовы и закрытие.
+    """Серверы MCP: схемы, вызовы и закрытие.
 
     Серверы запускаются лениво при первом `schemas()` — это происходит
     в рабочем потоке агента, а не в интерфейсе. Один сбой одного сервера
     не мешает остальным: причина попадает в `problems`.
+
+    Сессия может жить дольше одного вопроса: тогда владелец зовёт
+    `begin_question()` перед каждым вопросом и `close()` на выходе.
+    `AgentRunner` делает это сам; `--ask` просто закрывает сессию в конце.
     """
 
     def __init__(
@@ -765,6 +775,32 @@ class McpSession:
         self._map: dict[str, tuple[McpClient, str]] = {}
         self._restarts: dict[int, int] = {}
         self._schemas: list[dict] | None = None
+        self._closed = False
+
+    # --- границы вопросов -------------------------------------------------
+    def begin_question(self, should_stop: Callable[[], bool] | None = None) -> None:
+        """Новый вопрос: причины сбоев и бюджет перезапусков — заново.
+
+        Серверы, умершие между вопросами, поднимаем сразу: иначе первый
+        же вызов инструмента упал бы вхолостую. Если поднять не удалось,
+        причина попадёт в `problems`, а остальные серверы продолжат работу.
+        """
+        self.problems.clear()
+        if self._closed:
+            return
+        for client, prefix in list(self._clients):
+            self._restarts[id(client)] = self.limits.max_restarts
+            if client.alive and not client.broken:
+                continue
+            try:
+                client.restart(should_stop)
+                self._refresh_client(client, prefix)
+            except ToolError:
+                raise
+            except Exception as exc:
+                self.problems.append(
+                    f"«{client.server.id}»: не поднялся к новому вопросу: {exc}"
+                )
 
     # --- что видит агент --------------------------------------------------
     @property
@@ -781,6 +817,8 @@ class McpSession:
         self, should_stop: Callable[[], bool] | None = None
     ) -> list[dict]:
         """Схемы инструментов; при первом вызове запускает серверы."""
+        if self._closed:
+            return []
         if self._schemas is not None:
             return list(self._schemas)
 
@@ -991,6 +1029,7 @@ class McpSession:
 
     def close(self) -> None:
         """Закрываем все процессы; повторный вызов безопасен."""
+        self._closed = True
         for client, _prefix in self._clients:
             try:
                 client.stop()

@@ -114,6 +114,7 @@ class AgentWorker(QThread):
         *,
         context_tokens: int,
         max_tokens: int,
+        close_mcp: bool = True,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -123,6 +124,7 @@ class AgentWorker(QThread):
         self._limits = limits
         self._context_tokens = context_tokens
         self._max_tokens = max_tokens
+        self._close_mcp = close_mcp
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -166,8 +168,15 @@ class AgentWorker(QThread):
         self.finished_ok.emit(reply.text, reply.usage)
 
     def _close_context(self) -> None:
-        """Одна сессия на вопрос: после ответа закрываем интернет и MCP."""
-        for resource in (self._context.web, self._context.mcp):
+        """После ответа закрываем интернет; MCP — если он не живёт в окне.
+
+        Тёплая MCP-сессия принадлежит окну: её закрывает оно само, когда
+        меняются настройки серверов или MLVH выходит.
+        """
+        resources = [self._context.web]
+        if self._close_mcp:
+            resources.append(self._context.mcp)
+        for resource in resources:
             if resource is None:
                 continue
             try:

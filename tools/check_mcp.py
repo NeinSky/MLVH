@@ -45,7 +45,7 @@ def _fake_server():
 
 
 def _offline() -> int:
-    from app.agent.mcp import McpLimits, McpServer, McpSession
+    from app.agent.mcp import McpClient, McpLimits, McpServer, McpSession
     from app.agent.policy import ToolError
 
     print("MCP: фейковый сервер, офлайн")
@@ -151,6 +151,42 @@ def _offline() -> int:
         check("причина записана", bool(broken.problems), str(broken.problems))
     finally:
         broken.close()
+
+    print("MCP: тёплая сессия между вопросами")
+    starts: list[str] = []
+
+    class CountingClient(McpClient):
+        def start(self, should_stop=None):
+            starts.append(self.server.id)
+            super().start(should_stop)
+
+    warm = McpSession(
+        [_fake_server()],
+        McpLimits(timeout=3, start_timeout=20),
+        log_path=None,
+        client_factory=CountingClient,
+    )
+    try:
+        warm.schemas()
+        first = warm.call("mcp_demo_echo", {"text": "первый"})
+        warm.begin_question()
+        second = warm.call("mcp_demo_echo", {"text": "второй"})
+        check(
+            "второй вопрос не перезапускает сервер",
+            first.ok and second.ok and starts == ["demo"],
+            f"{starts} / {second.content}",
+        )
+        warm.call("mcp_demo_crash", {})
+        before = len(starts)
+        warm.begin_question()
+        check(
+            "умерший между вопросами сервер поднят заранее",
+            len(starts) > before and not warm.problems,
+            f"{starts} / {warm.problems}",
+        )
+    finally:
+        warm.close()
+    check("после close инструментов нет", warm.schemas() == [] and warm.names() == ())
 
     print()
     if FAILED:
