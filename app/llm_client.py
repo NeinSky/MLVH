@@ -7,6 +7,7 @@ Ollama, LM Studio, vLLM или корпоративный шлюз с тем ж�
 
 from __future__ import annotations
 
+import importlib
 import logging
 import urllib.parse
 from dataclasses import dataclass
@@ -172,9 +173,8 @@ class ChatClient:
         """
         if not self.is_local:
             return self._client, None
-        import httpx
 
-        http = httpx.Client(timeout=self._timeout, trust_env=False)
+        http = _http_library().Client(timeout=self._timeout, trust_env=False)
         client = Client(
             api_key=self._api_key,
             base_url=self.base_url,
@@ -348,6 +348,37 @@ class ChatClient:
 # До 0.7.0 клиент умел только DeepSeek — старые имена оставляем рабочими.
 DeepSeekClient = ChatClient
 DeepSeekError = LLMError
+
+
+def _http_library():
+    """HTTP-библиотека установленного openai: `httpx` в 1.x, `httpx2` в 3.x.
+
+    Отдельного `httpx` может не быть вовсе — в CI ставится только сам openai
+    со своими зависимостями, а с 3.0 он собран на `httpx2`. Поэтому модуль
+    спрашиваем у SDK, а не импортируем по имени: иначе `import httpx` падает
+    с ModuleNotFoundError ещё до первого запроса.
+    """
+    try:
+        from openai import _base_client
+    except ImportError:  # перепакованный SDK без внутренних модулей
+        _base_client = None
+    if _base_client is not None:
+        for name in ("httpx", "httpx2"):
+            module = getattr(_base_client, name, None)
+            if module is not None and hasattr(module, "Client"):
+                return module
+
+    for name in ("httpx", "httpx2"):
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        if hasattr(module, "Client"):
+            return module
+    raise LLMError(
+        "У пакета openai нет HTTP-клиента (httpx2/httpx). "
+        "Переустановите его: pip install --force-reinstall openai"
+    )
 
 
 def _reasoning_text(delta: object) -> str:

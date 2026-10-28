@@ -423,6 +423,49 @@ def test_llm_probe() -> None:
           str(models_urls("")))
 
 
+def test_local_http_client() -> None:
+    """Локальному провайдеру нужен HTTP-клиент openai, а не свой httpx.
+
+    В CI стоит только сам openai, а с 3.0 он собран на `httpx2`: прямой
+    `import httpx` падал с ModuleNotFoundError ещё до первого запроса.
+    """
+    print("локальный провайдер без своего httpx:")
+    from app.llm_client import _http_library
+
+    module = _http_library()
+    check("HTTP-клиент найден", hasattr(module, "Client"),
+          getattr(module, "__name__", str(module)))
+
+    # Как в CI: httpx нет, есть только то, что принёс openai.
+    code = (
+        "import sys;"
+        "import openai._base_client;"
+        "sys.modules['httpx'] = None;"
+        "from app.llm_client import ChatClient;"
+        "client = ChatClient(api_key='k', model='demo', base_url='http://127.0.0.1:9/v1');"
+        "inner, owned = client._request_client();"
+        "print('ok' if owned is not None else 'клиент не создан')"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        check("клиент создаётся без httpx", False, str(exc))
+        return
+
+    if result.returncode != 0:
+        tail = (result.stderr or "").strip().splitlines()[-1:]
+        check("клиент создаётся без httpx", False, " ".join(tail))
+        return
+    check("клиент создаётся без httpx", result.stdout.strip() == "ok",
+          result.stdout.strip())
+
+
 def test_audio_helpers() -> None:
     print("аудио:")
     from app.tts import audio_seconds, expected_seconds
@@ -1908,6 +1951,7 @@ def main() -> int:
         test_llm_settings,
         test_llm_client,
         test_llm_probe,
+        test_local_http_client,
         test_core_without_qt,
         test_version,
         test_audio_helpers,
