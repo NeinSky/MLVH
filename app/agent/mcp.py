@@ -62,6 +62,27 @@ def _tool_part(value: str) -> str:
     return text.strip("_") or "tool"
 
 
+def _tool_list(value: object) -> list[str]:
+    """Allowlist инструментов: строка режется по запятым и пробелам."""
+    if isinstance(value, str):
+        parts: list[str] = []
+        for chunk in value.replace(";", ",").split(","):
+            parts.extend(chunk.split())
+    elif isinstance(value, (list, tuple)):
+        parts = [str(item) for item in value]
+    else:
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        name = str(part).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        result.append(name)
+    return result
+
+
 def _as_float(value: object, default: float) -> float:
     try:
         return float(value)  # type: ignore[arg-type]
@@ -80,6 +101,7 @@ class McpServer:
     cwd: str = ""
     enabled: bool = True
     timeout: float = 0.0          # 0 — общий таймаут сессии
+    tools: list[str] = field(default_factory=list)  # allowlist; пусто — все
 
     @classmethod
     def from_dict(cls, data: object) -> "McpServer | None":
@@ -122,6 +144,7 @@ class McpServer:
             cwd=str(data.get("cwd") or "").strip(),
             enabled=enabled,
             timeout=max(0.0, min(600.0, _as_float(data.get("timeout"), 0.0))),
+            tools=_tool_list(data.get("tools")),
         )
 
     def to_dict(self) -> dict:
@@ -133,12 +156,16 @@ class McpServer:
             "cwd": self.cwd,
             "enabled": self.enabled,
             "timeout": int(self.timeout) if self.timeout else 0,
+            "tools": list(self.tools),
         }
 
     def label(self) -> str:
         """Строка для списка в окне: «id — command args»."""
         command = " ".join([self.command, *self.args]).strip()
-        return _short(f"{self.id} — {command}", 100)
+        text = f"{self.id} — {command}"
+        if self.tools:
+            text += f" · инструментов: {len(self.tools)}"
+        return _short(text, 120)
 
 
 @dataclass
@@ -874,15 +901,23 @@ class McpSession:
         used_names: set[str],
     ) -> None:
         assert self._schemas is not None
+        allowed = set(client.server.tools)
+        missing = set(allowed)
+        truncated = False
         for tool in tools:
             if len(self._map) >= self.limits.max_tools:
                 self.problems.append(
                     f"«{client.server.id}»: показаны не все инструменты — "
                     f"лимит {self.limits.max_tools}"
                 )
+                truncated = True
                 break
             tool_name = str(tool.get("name") or "").strip()
             if not tool_name:
+                continue
+            missing.discard(tool_name)
+            # Allowlist: остальные инструменты сервера модель не увидит.
+            if allowed and tool_name not in allowed:
                 continue
 
             public = _unique_tool_name(prefix, tool_name, used_names)
@@ -909,6 +944,14 @@ class McpSession:
 
             self._map[public] = (client, tool_name)
             self._schemas.append(schema)
+
+        if missing and not truncated:
+            preview = ", ".join(sorted(missing)[:5])
+            if len(missing) > 5:
+                preview += " …"
+            self.problems.append(
+                f"«{client.server.id}»: нет инструментов из списка: {preview}"
+            )
 
     # --- вызов ------------------------------------------------------------
     def call(

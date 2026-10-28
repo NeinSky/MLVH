@@ -849,7 +849,18 @@ class MainWindow(QMainWindow):
                     if part
                 )
                 item = QListWidgetItem(f"{server.get('id')} — {command}")
-                item.setToolTip(command)
+                tools = [
+                    str(name) for name in (server.get("tools") or []) if str(name).strip()
+                ]
+                if tools:
+                    item.setText(
+                        f"{server.get('id')} — {command} · инструментов: {len(tools)}"
+                    )
+                    item.setToolTip(
+                        command + "\nТолько эти инструменты: " + ", ".join(tools)
+                    )
+                else:
+                    item.setToolTip(command)
                 item.setData(Qt.ItemDataRole.UserRole, str(server.get("id") or ""))
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 enabled = bool(server.get("enabled", True))
@@ -1171,6 +1182,7 @@ class MainWindow(QMainWindow):
                     server.cwd,
                     server.enabled,
                     server.timeout,
+                    tuple(server.tools),
                 )
                 for server in servers
             ),

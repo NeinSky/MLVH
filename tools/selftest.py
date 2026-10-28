@@ -221,7 +221,12 @@ def test_settings() -> None:
         {
             "agent": {
                 "mcp_servers": [
-                    {"id": "Demo", "command": "python", "args": "-u server.py"},
+                    {
+                        "id": "Demo",
+                        "command": "python",
+                        "args": "-u server.py",
+                        "tools": "echo, page page",
+                    },
                     {"id": "", "command": "x"},
                     "bad",
                     {"id": "demo", "command": "node"},
@@ -253,6 +258,11 @@ def test_settings() -> None:
         mcp_settings.agent.mcp_timeout == 5
         and mcp_settings.agent.mcp_start_timeout == 600,
         f"{mcp_settings.agent.mcp_timeout}/{mcp_settings.agent.mcp_start_timeout}",
+    )
+    check(
+        "allowlist MCP нормализуется",
+        servers[0]["tools"] == ["echo", "page"] and servers[1]["tools"] == [],
+        str(servers),
     )
     restored_mcp = Settings.from_dict(mcp_settings.to_dict())
     check(
@@ -1019,6 +1029,70 @@ def test_agent_mcp() -> None:
         "после close сессия не отдаёт инструменты",
         warm.schemas() == [] and warm.names() == (),
     )
+
+    # Allowlist: модель видит только выбранные инструменты сервера.
+    allowed = McpSession(
+        [
+            McpServer(
+                id="demo",
+                command=sys.executable,
+                args=["-u", str(script)],
+                tools=["echo", "page"],
+            )
+        ],
+        McpLimits(timeout=2, start_timeout=20),
+        log_path=None,
+    )
+    try:
+        names = [item["function"]["name"] for item in allowed.schemas()]
+        check(
+            "allowlist оставляет только выбранные инструменты",
+            names == ["mcp_demo_echo", "mcp_demo_page"],
+            str(names),
+        )
+        check(
+            "вызов из allowlist работает",
+            allowed.call("mcp_demo_echo", {"text": "ок"}).ok,
+        )
+        try:
+            allowed.call("mcp_demo_fail", {})
+            check("инструмент вне allowlist недоступен", False)
+        except ToolError:
+            check("инструмент вне allowlist недоступен", True)
+        check(
+            "allowlist без опечаток не даёт проблем",
+            allowed.problems == [],
+            str(allowed.problems),
+        )
+    finally:
+        allowed.close()
+
+    typo = McpSession(
+        [
+            McpServer(
+                id="demo",
+                command=sys.executable,
+                args=["-u", str(script)],
+                tools=["echo", "нет-такого"],
+            )
+        ],
+        McpLimits(timeout=2, start_timeout=20),
+        log_path=None,
+    )
+    try:
+        names = [item["function"]["name"] for item in typo.schemas()]
+        check(
+            "опечатка в allowlist не ломает остальное",
+            names == ["mcp_demo_echo"],
+            str(names),
+        )
+        check(
+            "опечатка в allowlist видна в причинах",
+            any("нет-такого" in problem for problem in typo.problems),
+            str(typo.problems),
+        )
+    finally:
+        typo.close()
 
     class FakeMcp:
         def owns(self, name):

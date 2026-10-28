@@ -144,6 +144,27 @@ def _as_bool_value(value: object) -> bool:
     return bool(value)
 
 
+def _mcp_tool_list(raw: object) -> list[str]:
+    """Allowlist инструментов сервера: строка режется по запятым и пробелам."""
+    if isinstance(raw, str):
+        parts: list[str] = []
+        for chunk in raw.replace(";", ",").split(","):
+            parts.extend(chunk.split())
+    elif isinstance(raw, (list, tuple)):
+        parts = [str(item) for item in raw]
+    else:
+        return []
+    tools: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        name = str(part).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        tools.append(name)
+    return tools
+
+
 def _normalize_mcp_servers(raw: object) -> list[dict]:
     """MCP-серверы из конфига: только известные поля, битые записи пропускаем."""
     if not isinstance(raw, list):
@@ -196,6 +217,7 @@ def _normalize_mcp_servers(raw: object) -> list[dict]:
                 "cwd": str(item.get("cwd") or "").strip(),
                 "enabled": _as_bool_value(item.get("enabled", True)),
                 "timeout": max(0, min(600, timeout)),
+                "tools": _mcp_tool_list(item.get("tools")),
             }
         )
     return servers

@@ -188,6 +188,25 @@ def _offline() -> int:
         warm.close()
     check("после close инструментов нет", warm.schemas() == [] and warm.names() == ())
 
+    print("MCP: allowlist инструментов")
+    limited_config = _fake_server().to_dict()
+    limited_config["tools"] = ["echo", "page"]
+    limited = McpSession(
+        [McpServer.from_dict(limited_config)],
+        McpLimits(timeout=3, start_timeout=20),
+        log_path=None,
+    )
+    try:
+        names = [item["function"]["name"] for item in limited.schemas()]
+        check(
+            "allowlist оставляет только выбранные инструменты",
+            names == ["mcp_demo_echo", "mcp_demo_page"],
+            str(names),
+        )
+        check("проблем нет", limited.problems == [], str(limited.problems))
+    finally:
+        limited.close()
+
     print()
     if FAILED:
         print(f"Провалено: {len(FAILED)} — {', '.join(FAILED)}")

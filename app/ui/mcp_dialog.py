@@ -73,6 +73,15 @@ class McpServerDialog(QDialog):
         self.env_edit.setMinimumHeight(70)
         form.addRow("Окружение:", self.env_edit)
 
+        self.tools_edit = QPlainTextEdit("\n".join(data.get("tools") or []))
+        self.tools_edit.setPlaceholderText(
+            "Пусто — все инструменты сервера.\n"
+            "По одному в строке или через запятую:\n"
+            "take_snapshot, navigate_page"
+        )
+        self.tools_edit.setMinimumHeight(60)
+        form.addRow("Инструменты:", self.tools_edit)
+
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(0, 600)
         self.timeout_spin.setSuffix(" с")
@@ -86,8 +95,10 @@ class McpServerDialog(QDialog):
             "MCP-сервер — отдельная программа на вашем компьютере. Она не ограничена "
             "папками агента и может менять данные: запускайте только те серверы, "
             "которым доверяете. Ключ DeepSeek серверу не передаётся.\n"
+            "«Инструменты» — allowlist: если список заполнен, модель увидит только "
+            "эти инструменты сервера, остальные ей не предлагаются. Пусто — все.\n"
             "Пример: id «chrome-devtools», команда npx, аргументы «-y» и "
-            "«chrome-devtools-mcp@latest»."
+            "«chrome-devtools-mcp@latest», инструменты — take_snapshot и navigate_page."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#6b7280;")
@@ -133,6 +144,20 @@ class McpServerDialog(QDialog):
             env[key] = value.strip()
         return env
 
+    def _read_tools(self) -> list[str]:
+        """Allowlist из поля: по одному в строке или через запятую."""
+        tools: list[str] = []
+        seen: set[str] = set()
+        text = self.tools_edit.toPlainText().replace(";", ",")
+        for chunk in text.split(","):
+            for part in chunk.split():
+                name = part.strip()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                tools.append(name)
+        return tools
+
     def _on_save(self) -> None:
         server_id = self.id_edit.text().strip()
         command = self.command_edit.text().strip()
@@ -160,6 +185,7 @@ class McpServerDialog(QDialog):
             "cwd": self.cwd_edit.text().strip(),
             "enabled": self._enabled,
             "timeout": int(self.timeout_spin.value()),
+            "tools": self._read_tools(),
         }
         self.accept()
 
