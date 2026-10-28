@@ -49,7 +49,6 @@ class ProviderDialog(QDialog):
 
     def __init__(self, model: ModelSettings, parent=None) -> None:
         super().__init__(parent)
-        self._model = model
         self._result: dict | None = None
         self._probe: ProviderProbeWorker | None = None
 

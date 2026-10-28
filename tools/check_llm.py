@@ -360,12 +360,17 @@ def _live(base_url: str, alias: str) -> int:
     print(f"  {url}: моделей {len(models)}")
     check("список моделей получен", bool(models), str(models[:5]))
 
+    # Как в приложении: рассуждения тоже тратят токены, бюджет поднимаем.
+    max_tokens = model.max_tokens
+    if model.thinking:
+        max_tokens = max(max_tokens, 2000)
+
     try:
         client = ChatClient(
             api_key=key,
             model=model.name,
             temperature=model.temperature,
-            max_tokens=min(model.max_tokens, 400),
+            max_tokens=max_tokens,
             thinking=model.thinking,
             base_url=model.endpoint(),
             thinking_style=model.thinking_style,

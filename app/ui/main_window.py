@@ -72,9 +72,9 @@ from app.config import (
     save_api_key,
     save_settings,
 )
-from app.llm_client import ChatClient, LLMError
 from app.engines.registry import engine_infos, get_engine
 from app.engines.silero_engine import SPEAKERS as SILERO_SPEAKERS
+from app.llm_client import ChatClient, LLMError
 from app.personas import (
     Persona,
     is_builtin_persona,

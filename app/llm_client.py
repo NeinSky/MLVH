@@ -19,7 +19,6 @@ from app.config import is_local_host
 
 BASE_URL = "https://api.deepseek.com"
 DEFAULT_KEY_ENV = "DEEPSEEK_API_KEY"
-DEEPSEEK_HOST = "api.deepseek.com"
 
 log = logging.getLogger(__name__)
 
