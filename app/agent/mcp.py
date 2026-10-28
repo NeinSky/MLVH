@@ -325,8 +325,9 @@ class McpClient:
 
         argv = _build_argv(self.server.command, self.server.args)
         env = os.environ.copy()
-        # Ключ DeepSeek сторонним программам не передаём.
-        env.pop("DEEPSEEK_API_KEY", None)
+        # Ключи провайдеров модели сторонним программам не передаём.
+        for name in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+            env.pop(name, None)
         env.update(self.server.env)
 
         cwd = self.server.cwd or None

@@ -22,6 +22,7 @@ from app.agent import (
 from app.asr.base import ASREngine, ASRError
 from app.config import ASRSettings, TTSSettings
 from app.deepseek_client import DeepSeekClient, DeepSeekError
+from app.llm_probe import ProbeError, probe_models
 from app.tts import TTSError, TTSService
 
 
@@ -220,6 +221,35 @@ class McpProbeWorker(QThread):
             self.failed.emit(server.id, str(exc))
         finally:
             session.close()
+
+
+class ProviderProbeWorker(QThread):
+    """Проверка провайдера модели: GET /models и список доступных алиасов."""
+
+    done = Signal(str, list)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "",
+        timeout: float = 8.0,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._base_url = base_url
+        self._api_key = api_key
+        self._timeout = timeout
+
+    def run(self) -> None:
+        try:
+            url, models = probe_models(self._base_url, self._api_key, self._timeout)
+        except ProbeError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:  # поток не должен умирать молча
+            self.failed.emit(f"Проверка не удалась: {exc}")
+        else:
+            self.done.emit(url, models)
 
 
 class PrepareWorker(QThread):

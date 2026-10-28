@@ -272,6 +272,157 @@ def test_settings() -> None:
     )
 
 
+def test_llm_settings() -> None:
+    print("модель и провайдер:")
+    from app.config import (
+        DEFAULT_KEY_ENV,
+        DEEPSEEK_BASE_URL,
+        DEEPSEEK_KEY_ENV,
+        ModelSettings,
+        Settings,
+        is_local_host,
+        normalize_base_url,
+        normalize_env_name,
+    )
+
+    model = ModelSettings()
+    check("провайдер по умолчанию — DeepSeek", model.is_deepseek(), model.host())
+    check("адрес по умолчанию", model.endpoint() == DEEPSEEK_BASE_URL, model.endpoint())
+    check("ключ по умолчанию — DEEPSEEK_API_KEY",
+          model.key_env() == DEEPSEEK_KEY_ENV, model.key_env())
+    check("рассуждения по умолчанию — auto", model.thinking_style == "auto",
+          model.thinking_style)
+
+    custom = ModelSettings.from_dict(
+        {"base_url": "  https://openrouter.ai/api/v1/  ", "name": "openai/gpt-4o-mini"}
+    )
+    check("base_url обрезан", custom.base_url == "https://openrouter.ai/api/v1",
+          custom.base_url)
+    check("провайдер по хосту", custom.provider_name() == "openrouter.ai",
+          custom.provider_name())
+    check("ключ чужого провайдера — OPENAI_API_KEY",
+          custom.key_env() == DEFAULT_KEY_ENV, custom.key_env())
+
+    local = ModelSettings.from_dict({"base_url": "localhost:11434/v1", "name": "llama3"})
+    check("локальному адресу подставлен http",
+          local.base_url == "http://localhost:11434/v1", local.base_url)
+    check("локальный адрес — не DeepSeek", not local.is_deepseek())
+    check("is_local_host знает localhost", is_local_host("localhost:11434"))
+    check("is_local_host знает 127.0.0.1", is_local_host("127.0.0.1:8080"))
+    check("is_local_host не путает с чужаком", not is_local_host("openrouter.ai"))
+
+    deep = ModelSettings.from_dict(
+        {"base_url": "https://api.deepseek.com/v1", "api_key_env": "MY_KEY"}
+    )
+    check("своя переменная с ключом", deep.key_env() == "MY_KEY", deep.key_env())
+    check("адрес DeepSeek остаётся DeepSeek", deep.is_deepseek())
+    check("пустой алиас у DeepSeek", deep.name == "deepseek-flash", deep.name)
+
+    broken = ModelSettings.from_dict(
+        {"thinking_style": "что-то", "api_key_env": "1 плохое имя"}
+    )
+    check("битый thinking_style → auto", broken.thinking_style == "auto",
+          broken.thinking_style)
+    check("битое имя переменной отброшено", broken.api_key_env == "",
+          broken.api_key_env)
+    check("нормализация адреса без схемы",
+          normalize_base_url("openrouter.ai/api/v1") == "https://openrouter.ai/api/v1",
+          normalize_base_url("openrouter.ai/api/v1"))
+    check("пустое имя переменной", normalize_env_name("  ") == "")
+
+    data = Settings().to_dict()["model"]
+    check("to_dict знает провайдера",
+          data.get("base_url") == ""
+          and data.get("api_key_env") == ""
+          and data.get("thinking_style") == "auto",
+          str(data))
+    restored = Settings.from_dict({"model": data}).model
+    check("round-trip модели", restored.endpoint() == DEEPSEEK_BASE_URL,
+          restored.endpoint())
+
+
+def test_llm_client() -> None:
+    print("клиент модели:")
+    from types import SimpleNamespace as NS
+
+    from app.deepseek_client import ChatClient, LLMError, _reasoning_text, _usage_to_dict
+
+    check("reasoning из reasoning_content",
+          _reasoning_text(NS(reasoning_content="раз")) == "раз")
+    check("reasoning из reasoning", _reasoning_text(NS(reasoning="два")) == "два")
+    check("model_extra тоже читается",
+          _reasoning_text(NS(model_extra={"reasoning": "три"})) == "три")
+    check("без рассуждений — пусто", _reasoning_text(NS(content="текст")) == "")
+    check("usage без полей не ломается", _usage_to_dict(None)["total_tokens"] == 0)
+
+    deepseek = ChatClient(api_key="k", model="deepseek-flash", thinking=True)
+    check("DeepSeek получает thinking",
+          deepseek.thinking_payload() == {"thinking": {"type": "enabled"}},
+          str(deepseek.thinking_payload()))
+    check("подпись DeepSeek", deepseek.label == "DeepSeek", deepseek.label)
+    check("адрес по умолчанию — DeepSeek",
+          deepseek.base_url == "https://api.deepseek.com", deepseek.base_url)
+    check("ключ по умолчанию — DEEPSEEK_API_KEY",
+          deepseek.key_env == "DEEPSEEK_API_KEY", deepseek.key_env)
+
+    foreign = ChatClient(
+        api_key="k", model="gpt", thinking=True, base_url="https://openrouter.ai/api/v1"
+    )
+    check("чужому провайдеру thinking не отправляем",
+          foreign.thinking_payload() is None)
+    check("подпись по хосту", foreign.label == "openrouter.ai", foreign.label)
+    check("чужой ключ — OPENAI_API_KEY", foreign.key_env == "OPENAI_API_KEY",
+          foreign.key_env)
+
+    forced = ChatClient(
+        api_key="k", model="gpt", thinking=True, thinking_style="deepseek",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    check("style deepseek включает всегда", forced.thinking_payload() is not None)
+    muted = ChatClient(api_key="k", model="deepseek-flash", thinking=True,
+                       thinking_style="none")
+    check("style none выключает", muted.thinking_payload() is None)
+    quiet = ChatClient(api_key="k", model="deepseek-flash", thinking=False)
+    check("выключенные рассуждения молчат", quiet.thinking_payload() is None)
+
+    check("температура зажата", ChatClient(api_key="k", temperature=9).temperature == 2.0)
+    check("max_tokens снизу 1", ChatClient(api_key="k", max_tokens=0).max_tokens == 1)
+    check("локальный адрес распознан",
+          ChatClient(api_key="k", base_url="http://127.0.0.1:1234/v1").is_local)
+    check("чужой адрес не локальный", not foreign.is_local)
+
+    try:
+        ChatClient(api_key="", model="deepseek-flash")
+    except LLMError as exc:
+        check("без ключа — понятная ошибка", "DEEPSEEK_API_KEY" in str(exc), str(exc))
+    else:
+        check("без ключа — понятная ошибка", False)
+
+    try:
+        ChatClient(api_key="k", model="", base_url="https://openrouter.ai/api/v1")
+    except LLMError as exc:
+        check("без алиаса — понятная ошибка", "алиас" in str(exc).casefold(), str(exc))
+    else:
+        check("без алиаса — понятная ошибка", False)
+
+
+def test_llm_probe() -> None:
+    print("проверка подключения:")
+    from app.llm_probe import models_urls
+
+    check("адрес с /v1 — один вариант",
+          models_urls("https://openrouter.ai/api/v1")
+          == ["https://openrouter.ai/api/v1/models"],
+          str(models_urls("https://openrouter.ai/api/v1")))
+    check("адрес без /v1 — два варианта",
+          models_urls("https://api.deepseek.com")
+          == ["https://api.deepseek.com/models", "https://api.deepseek.com/v1/models"],
+          str(models_urls("https://api.deepseek.com")))
+    check("пустой адрес — DeepSeek",
+          models_urls("")[0] == "https://api.deepseek.com/models",
+          str(models_urls("")))
+
+
 def test_audio_helpers() -> None:
     print("аудио:")
     from app.tts import audio_seconds, expected_seconds
@@ -297,6 +448,15 @@ def test_example_config() -> None:
           (data.get("model") or {}).get("context_tokens") == 1_000_000,
           str((data.get("model") or {}).get("context_tokens")))
     agent = data.get("agent") or {}
+    model_example = data.get("model") or {}
+    check("провайдер в примере — DeepSeek", model_example.get("base_url") == "",
+          str(model_example.get("base_url")))
+    check("переменная с ключом пуста в примере",
+          model_example.get("api_key_env") == "",
+          str(model_example.get("api_key_env")))
+    check("рассуждения в примере — auto",
+          model_example.get("thinking_style") == "auto",
+          str(model_example.get("thinking_style")))
     check("шагов в примере — 20", agent.get("max_rounds") == 20,
           str(agent.get("max_rounds")))
     check("вызовов в примере — 100", agent.get("max_tool_calls") == 100,
@@ -1672,6 +1832,7 @@ def test_core_without_qt() -> None:
         "import app.asr.wakeword, app.asr.registry;"
         "import app.agent, app.agent.policy, app.agent.context;"
         "import app.agent.tools, app.agent.runner, app.agent.web, app.agent.mcp;"
+        "import app.llm_probe, app.deepseek_client;"
         "print('PySide6' in sys.modules)"
     )
     try:
@@ -1744,6 +1905,9 @@ def main() -> int:
         test_agent_context,
         test_tool_call_accumulator,
         test_agent_runner,
+        test_llm_settings,
+        test_llm_client,
+        test_llm_probe,
         test_core_without_qt,
         test_version,
         test_audio_helpers,

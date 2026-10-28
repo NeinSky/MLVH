@@ -35,6 +35,9 @@ jobs:
       - name: Самопроверка
         run: python tools/selftest.py
 
+      - name: Проверка клиента модели (офлайн)
+        run: python tools/check_llm.py
+
       - name: Пример конфига — валидный JSON
         run: python -c "import json; json.load(open('config.example.json', encoding='utf-8'))"
 

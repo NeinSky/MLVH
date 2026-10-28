@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
-    QInputDialog,
     QKeySequenceEdit,
     QLabel,
     QLineEdit,
@@ -73,7 +72,7 @@ from app.config import (
     save_api_key,
     save_settings,
 )
-from app.deepseek_client import DeepSeekClient, DeepSeekError
+from app.deepseek_client import ChatClient, LLMError
 from app.engines.registry import engine_infos, get_engine
 from app.engines.silero_engine import SPEAKERS as SILERO_SPEAKERS
 from app.personas import (
@@ -87,6 +86,7 @@ from app.ui.level_meter import LevelMeter
 from app.ui.mcp_dialog import McpServerDialog
 from app.ui.mic_dialog import MicDialog
 from app.ui.persona_dialog import PersonaDialog
+from app.ui.provider_dialog import ProviderDialog
 from app.ui.workers import (
     AgentWorker,
     ChatWorker,
@@ -293,6 +293,10 @@ class MainWindow(QMainWindow):
         self.model_combo.addItems(AVAILABLE_MODELS)
         self.model_combo.currentTextChanged.connect(self._on_model_changed)
         row.addWidget(self.model_combo)
+
+        self.provider_label = QLabel("")
+        self.provider_label.setObjectName("Subtitle")
+        row.addWidget(self.provider_label)
 
         self.key_state = QLabel("")
         row.addWidget(self.key_state)
@@ -733,9 +737,7 @@ class MainWindow(QMainWindow):
             self.agent_mcp_servers,
         ):
             widget.blockSignals(True)
-        self.model_combo.setCurrentText(
-            model.name if model.name in AVAILABLE_MODELS else AVAILABLE_MODELS[0]
-        )
+        self._refresh_provider_ui()
         persona_index = self.persona_combo.findData(self.settings.active_persona)
         if persona_index >= 0:
             self.persona_combo.setCurrentIndex(persona_index)
@@ -1208,7 +1210,33 @@ class MainWindow(QMainWindow):
         except Exception:  # закрытие не должно мешать работе окна
             pass
 
+    def _refresh_provider_ui(self) -> None:
+        """Шапка окна: у DeepSeek список моделей, у чужого провайдера — алиас.
+
+        Алиас чужого провайдера задаётся в диалоге «Ключ и провайдер», поэтому
+        выпадающий список в этом случае недоступен и показывает только его.
+        """
+        model = self.settings.model
+        custom = not model.is_deepseek()
+        self.provider_label.setText(model.provider_name())
+        self.provider_label.setToolTip(f"API: {model.endpoint()}")
+
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        self.model_combo.addItems(AVAILABLE_MODELS)
+        if model.name and model.name not in AVAILABLE_MODELS:
+            self.model_combo.addItem(model.name)
+        self.model_combo.setCurrentText(model.name or AVAILABLE_MODELS[0])
+        self.model_combo.blockSignals(False)
+
+        self.model_combo.setEnabled(not custom)
+        self.model_combo.setToolTip(
+            "Алиас модели задаётся в окне «Ключ и провайдер»" if custom else ""
+        )
+
     def _on_model_changed(self, name: str) -> None:
+        if not name or not self.settings.model.is_deepseek():
+            return
         self.settings.model.name = name
         self._touch()
 
@@ -2178,36 +2206,56 @@ class MainWindow(QMainWindow):
 
     # --- ключ -----------------------------------------------------------
     def _refresh_key_state(self) -> None:
-        key = get_api_key()
+        model = self.settings.model
+        key = get_api_key(model)
         if key:
-            self.key_state.setText(f"ключ: {mask_key(key)}")
+            self.key_state.setText(f"ключ: {mask_key(key)} ({model.key_env()})")
             self.key_state.setObjectName("KeyOk")
             self.key_button.setText("Сменить ключ")
         else:
-            self.key_state.setText("ключ не задан")
+            self.key_state.setText(f"ключ не задан ({model.key_env()})")
             self.key_state.setObjectName("KeyMissing")
             self.key_button.setText("Ввести ключ")
         self.key_state.style().unpolish(self.key_state)
         self.key_state.style().polish(self.key_state)
+        self.key_state.setToolTip(
+            f"Ответы: {model.provider_name()}, модель {model.name or '—'}"
+        )
 
     def _ask_api_key(self) -> None:
-        key, ok = QInputDialog.getText(
-            self,
-            "Ключ DeepSeek",
-            "Вставьте ключ с platform.deepseek.com/api_keys.\n"
-            "Он сохранится в .env рядом с программой.",
-            QLineEdit.EchoMode.Password,
-            "",
-        )
-        if not ok or not key.strip():
+        """Провайдер и ключ: DeepSeek — только ключ, чужой API — ещё адрес и алиас."""
+        dialog = ProviderDialog(self.settings.model, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        try:
-            save_api_key(key)
-        except OSError as exc:
-            QMessageBox.warning(self, "MLVH", f"Не удалось записать .env: {exc}")
+        data = dialog.result_settings()
+        if not data:
             return
+
+        model = self.settings.model
+        model.base_url = data["base_url"]
+        model.name = data["name"]
+        model.api_key_env = data["api_key_env"]
+        model.thinking_style = data["thinking_style"]
+
+        key = data["api_key"]
+        if key:
+            try:
+                save_api_key(key, model)
+            except OSError as exc:
+                QMessageBox.warning(self, "MLVH", f"Не удалось записать .env: {exc}")
+                return
+
+        self._touch()
+        self._apply_settings()
         self._refresh_key_state()
-        self.statusBar().showMessage("Ключ сохранён в .env", 5000)
+        if key:
+            self.statusBar().showMessage(
+                f"Ключ сохранён в .env как {model.key_env()}", 5000
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Ответы: {model.provider_name()}, модель {model.name}", 5000
+            )
 
     # --- чат ------------------------------------------------------------
     def _assistant_name(self) -> str:
@@ -2299,7 +2347,7 @@ class MainWindow(QMainWindow):
         if not text:
             return
 
-        key = get_api_key()
+        key = get_api_key(self.settings.model)
         if not key:
             self._prompt_for_key()
             return
@@ -2340,14 +2388,17 @@ class MainWindow(QMainWindow):
             )
 
         try:
-            client = DeepSeekClient(
+            client = ChatClient(
                 api_key=key,
                 model=model.name,
                 temperature=model.temperature,
                 max_tokens=max_tokens,
                 thinking=model.thinking,
+                base_url=model.endpoint(),
+                thinking_style=model.thinking_style,
+                key_env=model.key_env(),
             )
-        except DeepSeekError as exc:
+        except LLMError as exc:
             self._drop_pending_question()
             self._show_error(str(exc))
             return
@@ -2387,7 +2438,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "MLVH",
-            "Для ответов нужен ключ DeepSeek — без него модель недоступна.\n"
+            "Для ответов нужен ключ провайдера — без него модель недоступна.\n"
             "Ввести ключ сейчас?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )

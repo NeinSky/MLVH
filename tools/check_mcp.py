@@ -314,16 +314,16 @@ def _agent_live(args) -> int:
     )
     from app.agent.mcp import McpLimits, McpSession
     from app.config import get_api_key, load_settings
-    from app.deepseek_client import DeepSeekClient, DeepSeekError
-
-    key = get_api_key()
-    if not key:
-        print("Нужен DEEPSEEK_API_KEY в .env")
-        return 1
+    from app.deepseek_client import ChatClient, LLMError
 
     settings = load_settings()
-    limits = AgentLimits.from_settings(settings.agent)
     model = settings.model
+    key = get_api_key(model)
+    if not key:
+        print(f"Нужен {model.key_env()} в .env")
+        return 1
+
+    limits = AgentLimits.from_settings(settings.agent)
     max_tokens = max(model.max_tokens, 2000) if model.thinking else model.max_tokens
 
     session = McpSession(
@@ -348,12 +348,15 @@ def _agent_live(args) -> int:
             max_tokens,
         ).messages
 
-        client = DeepSeekClient(
+        client = ChatClient(
             api_key=key,
             model=model.name,
             temperature=model.temperature,
             max_tokens=max_tokens,
             thinking=model.thinking,
+            base_url=model.endpoint(),
+            thinking_style=model.thinking_style,
+            key_env=model.key_env(),
         )
 
         def on_tool(summary: str) -> None:
@@ -372,8 +375,8 @@ def _agent_live(args) -> int:
         )
         try:
             reply = runner.run()
-        except DeepSeekError as exc:
-            print(f"\nОшибка DeepSeek: {exc}")
+        except LLMError as exc:
+            print(f"\nОшибка модели: {exc}")
             return 1
     finally:
         session.close()

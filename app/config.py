@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import urllib.parse
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
@@ -27,6 +29,17 @@ AVAILABLE_MODELS = ("deepseek-flash", "deepseek-v4-pro")
 DEFAULT_VOICE = "ru-RU-DmitryNeural"
 FALLBACK_VOICES = ("ru-RU-DmitryNeural", "ru-RU-SvetlanaNeural")
 
+# --- провайдер модели ----------------------------------------------------
+# Пустой base_url — DeepSeek; иначе любой OpenAI-совместимый API
+# (OpenRouter, Groq, Ollama, LM Studio, vLLM, корпоративный шлюз).
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_KEY_ENV = "DEEPSEEK_API_KEY"
+DEFAULT_KEY_ENV = "OPENAI_API_KEY"          # ключ остальных провайдеров
+DEFAULT_MODEL_ALIAS = AVAILABLE_MODELS[0]
+THINKING_STYLES = ("auto", "none", "deepseek")
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"}
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 # Конфига ещё нет — работаем от характера по умолчанию (Элви).
 DEFAULT_SYSTEM_PROMPT = ELVI_PROMPT
 
@@ -46,11 +59,71 @@ def _clamp_int(value: object, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, number))
 
 
+def is_local_host(host: str) -> bool:
+    """Локальный ли адрес API: такому серверу не нужен прокси из системы."""
+    name = (host or "").strip().casefold()
+    if name.startswith("["):                    # [::1]:11434
+        name = name[1:].split("]", 1)[0]
+    else:
+        name = name.split(":", 1)[0]
+    return name in _LOCAL_HOSTS or name.startswith("127.")
+
+
+def normalize_base_url(raw: object) -> str:
+    """Адрес API из конфига: пробелы и хвостовой «/» убираем, схему добавляем.
+
+    Пусто — DeepSeek (см. `ModelSettings.endpoint`). Локальным серверам
+    (localhost, 127.0.0.1) подставляем http, остальным — https.
+    """
+    text = str(raw or "").strip().rstrip("/")
+    if not text:
+        return ""
+    if "://" not in text:
+        host = text.split("/", 1)[0]
+        if ":" in host and not host.startswith("["):
+            host = host.rsplit(":", 1)[0]
+        scheme = "http" if host.casefold() in _LOCAL_HOSTS else "https"
+        text = f"{scheme}://{text}"
+    return text
+
+
+def normalize_env_name(raw: object) -> str:
+    """Имя переменной с ключом. Пусто или мусор — пусто, дальше дефолт по провайдеру."""
+    name = str(raw or "").strip()
+    if not name:
+        return ""
+    if not _ENV_NAME.fullmatch(name):
+        print(
+            f"[config] Имя переменной «{name}» не годится: нужны латиница, "
+            "цифры и «_» — берём имя по умолчанию."
+        )
+        return ""
+    return name
+
+
+def _normalize_thinking_style(raw: object) -> str:
+    style = str(raw or "auto").strip().casefold()
+    if style not in THINKING_STYLES:
+        print(
+            f"[config] Неизвестный режим рассуждений «{raw}» — включён auto."
+        )
+        return "auto"
+    return style
+
+
 @dataclass
 class ModelSettings:
-    """Параметры запроса к DeepSeek."""
+    """Параметры запроса к модели: провайдер, алиас, температура и окно."""
 
-    name: str = "deepseek-flash"
+    name: str = DEFAULT_MODEL_ALIAS
+    # Пусто — DeepSeek. Иначе адрес OpenAI-совместимого API вместе с префиксом:
+    # https://openrouter.ai/api/v1, http://localhost:11434/v1, https://api.groq.com/openai/v1.
+    base_url: str = ""
+    # Переменная в .env, в которой лежит ключ. Пусто — по провайдеру:
+    # DEEPSEEK_API_KEY для DeepSeek, OPENAI_API_KEY для остальных.
+    api_key_env: str = ""
+    # Как отправлять режим рассуждений: auto (только DeepSeek), none, deepseek.
+    thinking_style: str = "auto"
     temperature: float = 0.7
     max_tokens: int = 2000
     thinking: bool = False
@@ -61,10 +134,41 @@ class ModelSettings:
     @classmethod
     def from_dict(cls, data: dict) -> "ModelSettings":
         settings = cls(**_known_values(cls, data))
+        settings.base_url = normalize_base_url(settings.base_url)
+        settings.name = str(settings.name or "").strip()
+        if not settings.name:
+            settings.name = DEFAULT_MODEL_ALIAS if settings.is_deepseek() else ""
+        settings.api_key_env = normalize_env_name(settings.api_key_env)
+        settings.thinking_style = _normalize_thinking_style(settings.thinking_style)
         settings.context_tokens = _clamp_int(
             settings.context_tokens, 1_000_000, 32_000, 2_000_000
         )
         return settings
+
+    # --- провайдер -------------------------------------------------------
+    def endpoint(self) -> str:
+        """Адрес API: пустой base_url означает DeepSeek."""
+        return self.base_url.strip() or DEEPSEEK_BASE_URL
+
+    def host(self) -> str:
+        """Хост для текстов: «api.deepseek.com», «openrouter.ai»."""
+        return urllib.parse.urlsplit(self.endpoint()).netloc or self.endpoint()
+
+    def is_deepseek(self) -> bool:
+        """DeepSeek ли это (по хосту, а не по имени модели)."""
+        host = self.host().casefold()
+        return host == "deepseek.com" or host.endswith(".deepseek.com")
+
+    def provider_name(self) -> str:
+        """Имя провайдера для интерфейса и ошибок."""
+        return "DeepSeek" if self.is_deepseek() else self.host()
+
+    def key_env_default(self) -> str:
+        return DEEPSEEK_KEY_ENV if self.is_deepseek() else DEFAULT_KEY_ENV
+
+    def key_env(self) -> str:
+        """Имя переменной окружения с ключом этого провайдера."""
+        return self.api_key_env or self.key_env_default()
 
 
 @dataclass
@@ -439,6 +543,9 @@ class Settings:
         return {
             "model": {
                 "name": self.model.name,
+                "base_url": self.model.base_url,
+                "api_key_env": self.model.api_key_env,
+                "thinking_style": self.model.thinking_style,
                 "temperature": self.model.temperature,
                 "max_tokens": self.model.max_tokens,
                 "thinking": self.model.thinking,
@@ -552,27 +659,32 @@ def save_settings(settings: Settings) -> None:
     )
 
 
-def get_api_key() -> str:
-    """Ключ DeepSeek из окружения (.env подхватывается при импорте)."""
-    return (os.getenv("DEEPSEEK_API_KEY") or "").strip()
+def get_api_key(model: "ModelSettings | None" = None) -> str:
+    """Ключ провайдера из окружения (.env подхватывается при импорте).
+
+    Без аргумента — ключ DeepSeek, как было до 0.7.0.
+    """
+    env_name = model.key_env() if model is not None else DEEPSEEK_KEY_ENV
+    return (os.getenv(env_name) or "").strip()
 
 
-def save_api_key(key: str) -> None:
-    """Записываем ключ в .env, не трогая остальные строки."""
+def save_api_key(key: str, model: "ModelSettings | None" = None) -> None:
+    """Записываем ключ в .env в переменную этого провайдера, не трогая остальные строки."""
     key = key.strip()
+    env_name = model.key_env() if model is not None else DEEPSEEK_KEY_ENV
     lines: list[str] = []
     if ENV_PATH.exists():
         lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
 
     for index, line in enumerate(lines):
-        if line.strip().startswith("DEEPSEEK_API_KEY="):
-            lines[index] = f"DEEPSEEK_API_KEY={key}"
+        if line.strip().startswith(f"{env_name}="):
+            lines[index] = f"{env_name}={key}"
             break
     else:
-        lines.append(f"DEEPSEEK_API_KEY={key}")
+        lines.append(f"{env_name}={key}")
 
     ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.environ["DEEPSEEK_API_KEY"] = key
+    os.environ[env_name] = key
 
 
 def mask_key(key: str) -> str:

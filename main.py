@@ -8,7 +8,13 @@ import tempfile
 from pathlib import Path
 
 from app import __version__
-from app.config import Settings, get_api_key, load_settings
+from app.config import (
+    Settings,
+    get_api_key,
+    load_settings,
+    normalize_base_url,
+    normalize_env_name,
+)
 from app.personas import persona_by_id
 
 
@@ -91,9 +97,30 @@ def main() -> int:
         action="store_true",
         help="для проверок: разрешить локальные адреса (127.0.0.1) в --ask",
     )
+    parser.add_argument(
+        "--base-url",
+        metavar="URL",
+        help="адрес OpenAI-совместимого API (по умолчанию DeepSeek)",
+    )
+    parser.add_argument(
+        "--model",
+        metavar="ALIAS",
+        help="алиас модели у провайдера (по умолчанию из config.json)",
+    )
+    parser.add_argument(
+        "--key-env",
+        metavar="NAME",
+        help="переменная окружения с ключом (по умолчанию по провайдеру)",
+    )
     args = parser.parse_args()
 
     settings = load_settings()
+    if args.base_url is not None:
+        settings.model.base_url = normalize_base_url(args.base_url)
+    if args.model:
+        settings.model.name = args.model.strip()
+    if args.key_env:
+        settings.model.api_key_env = normalize_env_name(args.key_env)
     if args.no_voice:
         settings.tts.enabled = False
 
@@ -270,14 +297,16 @@ def _ask(text: str, settings: Settings, args) -> int:
         build_messages,
         mcp_servers_from_settings,
     )
-    from app.deepseek_client import DeepSeekClient, DeepSeekError
-
-    key = get_api_key()
-    if not key:
-        print("Не задан ключ DeepSeek: положите DEEPSEEK_API_KEY в .env.")
-        return 1
+    from app.deepseek_client import ChatClient, LLMError
 
     model = settings.model
+    key = get_api_key(model)
+    if not key:
+        print(
+            f"Не задан ключ {model.provider_name()}: "
+            f"положите {model.key_env()} в .env."
+        )
+        return 1
     max_tokens = model.max_tokens
     if model.thinking:
         max_tokens = max(max_tokens, 2000)
@@ -339,14 +368,17 @@ def _ask(text: str, settings: Settings, args) -> int:
     )
 
     try:
-        client = DeepSeekClient(
+        client = ChatClient(
             api_key=key,
             model=model.name,
             temperature=model.temperature,
             max_tokens=max_tokens,
             thinking=model.thinking,
+            base_url=model.endpoint(),
+            thinking_style=model.thinking_style,
+            key_env=model.key_env(),
         )
-    except DeepSeekError as exc:
+    except LLMError as exc:
         print(f"Ошибка: {exc}")
         return 1
 
@@ -355,7 +387,7 @@ def _ask(text: str, settings: Settings, args) -> int:
             for event in client.stream_chat(trimmed.messages):
                 if event.kind == "content":
                     print(event.text, end="", flush=True)
-        except DeepSeekError as exc:
+        except LLMError as exc:
             print(f"\nОшибка: {exc}")
             return 1
         print()
@@ -387,7 +419,7 @@ def _ask(text: str, settings: Settings, args) -> int:
             on_tool=on_tool,
         )
         reply = runner.run()
-    except DeepSeekError as exc:
+    except LLMError as exc:
         print(f"\nОшибка: {exc}")
         return 1
     finally:
@@ -422,8 +454,11 @@ def _run_gui(settings: Settings) -> int:
     window = MainWindow(settings)
     window.show()
 
-    if not get_api_key():
-        print("Ключ DeepSeek не задан: нажмите «Ввести ключ» в окне MLVH.")
+    if not get_api_key(settings.model):
+        print(
+            f"Ключ {settings.model.provider_name()} не задан: "
+            "нажмите «Ввести ключ» в окне MLVH."
+        )
     return app.exec()
 
 

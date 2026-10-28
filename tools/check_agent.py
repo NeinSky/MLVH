@@ -224,16 +224,16 @@ def _live(args) -> int:
         build_agent_prompt,
     )
     from app.config import get_api_key, load_settings
-    from app.deepseek_client import DeepSeekClient, DeepSeekError
-
-    print("Агент: живая проверка через DeepSeek")
-    key = get_api_key()
-    if not key:
-        print("  FAIL нет ключа DeepSeek (.env)")
-        return 1
+    from app.deepseek_client import ChatClient, LLMError
 
     settings = load_settings()
     model = settings.model
+    print(f"Агент: живая проверка через {model.provider_name()} ({model.name})")
+    key = get_api_key(model)
+    if not key:
+        print(f"  FAIL нет ключа {model.provider_name()} ({model.key_env()} в .env)")
+        return 1
+
     max_tokens = model.max_tokens
     if model.thinking:
         max_tokens = max(max_tokens, 2000)
@@ -286,14 +286,17 @@ def _live(args) -> int:
                 {"role": "user", "content": question},
             ]
             try:
-                client = DeepSeekClient(
+                client = ChatClient(
                     api_key=key,
                     model=model.name,
                     temperature=model.temperature,
                     max_tokens=max_tokens,
                     thinking=model.thinking,
+                    base_url=model.endpoint(),
+                    thinking_style=model.thinking_style,
+                    key_env=model.key_env(),
                 )
-            except DeepSeekError as exc:
+            except LLMError as exc:
                 print(f"  FAIL {exc}")
                 return 1
 
@@ -324,7 +327,7 @@ def _live(args) -> int:
             )
             try:
                 reply = runner.run()
-            except DeepSeekError as exc:
+            except LLMError as exc:
                 print(f"\n  FAIL {exc}")
                 return 1
             print()

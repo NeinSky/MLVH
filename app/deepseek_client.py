@@ -1,21 +1,38 @@
-"""Тонкая обёртка над DeepSeek API (совместим с официальным SDK openai)."""
+"""Клиент модели: OpenAI-совместимый API (DeepSeek по умолчанию).
+
+Стриминг, инструменты (tools), рассуждения и понятные тексты ошибок.
+Адрес API задаётся `base_url`: пусто — DeepSeek, иначе OpenRouter, Groq,
+Ollama, LM Studio, vLLM или корпоративный шлюз с тем же протоколом.
+"""
 
 from __future__ import annotations
 
 import logging
+import urllib.parse
 from dataclasses import dataclass
 from typing import Iterator
 
 import openai
 from openai import Client
 
+from app.config import is_local_host
+
 BASE_URL = "https://api.deepseek.com"
+DEFAULT_KEY_ENV = "DEEPSEEK_API_KEY"
+DEEPSEEK_HOST = "api.deepseek.com"
 
 log = logging.getLogger(__name__)
 
 
-class DeepSeekError(RuntimeError):
-    """Ошибка с текстом, который не стыдно показать пользователю."""
+class LLMError(RuntimeError):
+    """Ошибка с текстом, который не стыдно показать пользователю.
+
+    `status` — HTTP-код, если ошибку вернул провайдер (401, 402, 404, 400…).
+    """
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -77,8 +94,14 @@ class ToolCallAccumulator:
         return calls
 
 
-class DeepSeekClient:
-    """Клиент чата DeepSeek. Держит один HTTP-клиент на один диалог."""
+class ChatClient:
+    """Клиент чата. Держит один HTTP-клиент на один диалог.
+
+    Рассуждения DeepSeek включает через `extra_body={"thinking": ...}`. Этот
+    параметр понимает только DeepSeek, остальные провайдеры отвечают на него
+    400, поэтому `thinking_style` решает, отправлять ли его:
+    `auto` — только DeepSeek, `none` — никогда, `deepseek` — всегда.
+    """
 
     def __init__(
         self,
@@ -88,32 +111,104 @@ class DeepSeekClient:
         max_tokens: int = 1200,
         thinking: bool = False,
         timeout: float = 90.0,
+        base_url: str = "",
+        thinking_style: str = "auto",
+        key_env: str = "",
     ) -> None:
-        if not api_key:
-            raise DeepSeekError(
-                "Не задан ключ DeepSeek. Нажмите «Ввести ключ» в окне MLVH "
-                "или положите DEEPSEEK_API_KEY в файл .env."
-            )
-        self.model = model
-        self.temperature = temperature
-        self.max_tokens = max_tokens
+        self.base_url = (base_url or "").strip().rstrip("/") or BASE_URL
+        self.thinking_style = (thinking_style or "auto").strip().casefold()
+        self.key_env = key_env or self._default_key_env()
+        self.model = str(model or "").strip()
+        self.temperature = _clamp_float(temperature, 0.0, 2.0, 0.7)
+        self.max_tokens = max(1, _clamp_int(max_tokens, 1200))
         self.thinking = thinking
         self._api_key = api_key
+        self._timeout = timeout
+        # Некоторые локальные серверы не знают stream_options — выключаем после 400.
+        self._stream_options = True
+
+        if not self.model:
+            raise LLMError(
+                "Не задан алиас модели. Укажите его в окне «Ввести ключ» "
+                "или в поле model.name файла config.json."
+            )
+        if not api_key:
+            raise LLMError(
+                f"Не задан ключ {self.label}. Нажмите «Ввести ключ» в окне MLVH "
+                f"или положите {self.key_env} в файл .env."
+            )
         self._client = Client(
             api_key=api_key,
-            base_url=BASE_URL,
+            base_url=self.base_url,
             timeout=timeout,
             max_retries=1,
         )
 
-    def clone(self, *, thinking: bool | None = None, max_tokens: int | None = None) -> "DeepSeekClient":
+    # --- провайдер -------------------------------------------------------
+    @property
+    def host(self) -> str:
+        """Хост API без схемы и пути: «api.deepseek.com», «openrouter.ai»."""
+        return urllib.parse.urlsplit(self.base_url).netloc or self.base_url
+
+    @property
+    def is_deepseek(self) -> bool:
+        host = self.host.casefold()
+        return host == "deepseek.com" or host.endswith(".deepseek.com")
+
+    @property
+    def label(self) -> str:
+        """Имя провайдера для текстов: DeepSeek или хост."""
+        return "DeepSeek" if self.is_deepseek else self.host
+
+    @property
+    def is_local(self) -> bool:
+        """Локальный сервер (Ollama, LM Studio, vLLM): системный прокси не нужен."""
+        return is_local_host(self.host)
+
+    def _request_client(self) -> tuple[Client, Client | None]:
+        """HTTP-клиент на один запрос: локальному серверу отключаем прокси.
+
+        Иначе прокси из системы (он же виноват в 503) перехватывает запрос
+        к 127.0.0.1. Возвращаем клиент и его же, если его нужно закрыть.
+        """
+        if not self.is_local:
+            return self._client, None
+        import httpx
+
+        http = httpx.Client(timeout=self._timeout, trust_env=False)
+        client = Client(
+            api_key=self._api_key,
+            base_url=self.base_url,
+            http_client=http,
+            max_retries=1,
+        )
+        return client, client
+
+    def _default_key_env(self) -> str:
+        return DEFAULT_KEY_ENV if self.is_deepseek else "OPENAI_API_KEY"
+
+    def thinking_payload(self) -> dict | None:
+        """`extra_body` для режима рассуждений; None — не отправлять."""
+        if not self.thinking:
+            return None
+        if self.thinking_style == "none":
+            return None
+        if self.thinking_style == "deepseek" or self.is_deepseek:
+            return {"thinking": {"type": "enabled"}}
+        return None
+
+    def clone(self, *, thinking: bool | None = None, max_tokens: int | None = None) -> "ChatClient":
         """Копия клиента с другими параметрами — для повторного запроса."""
-        return DeepSeekClient(
+        return ChatClient(
             api_key=self._api_key,
             model=self.model,
             temperature=self.temperature,
             max_tokens=self.max_tokens if max_tokens is None else max_tokens,
             thinking=self.thinking if thinking is None else thinking,
+            timeout=self._timeout,
+            base_url=self.base_url,
+            thinking_style=self.thinking_style,
+            key_env=self.key_env,
         )
 
     def stream_chat(
@@ -121,11 +216,29 @@ class DeepSeekClient:
         messages: list[dict],
         tools: list[dict] | None = None,
     ) -> Iterator[StreamEvent]:
-        """Стримим ответ. Ошибки приводим к DeepSeekError.
+        """Стримим ответ. Ошибки приводим к LLMError.
 
         Если передан `tools`, модель может попросить инструменты: в конце
         потока отдаём готовые `tool_call`-события.
         """
+        params = self._params(messages, tools)
+        emitted = False
+        try:
+            for event in self._stream(params):
+                emitted = True
+                yield event
+        except LLMError as exc:
+            # Провайдер не знает stream_options (обычно локальный сервер):
+            # повторяем один раз без него, если ещё ничего не отдали.
+            if emitted or exc.status != 400 or "stream_options" not in params:
+                raise
+            log.info("%s отверг stream_options, повторяю без него", self.label)
+            self._stream_options = False
+            params.pop("stream_options", None)
+            for event in self._stream(params):
+                yield event
+
+    def _params(self, messages: list[dict], tools: list[dict] | None) -> dict:
         params: dict = {
             "model": self.model,
             "messages": messages,
@@ -135,64 +248,147 @@ class DeepSeekClient:
         }
         if tools:
             params["tools"] = tools
-        if self.thinking:
-            # Включаем режим рассуждений (deepseek-flash / deepseek-v4-pro).
-            params["extra_body"] = {"thinking": {"type": "enabled"}}
+        thinking = self.thinking_payload()
+        if thinking is not None:
+            params["extra_body"] = thinking
+        if self._stream_options:
+            # Без этого флага часть провайдеров не присылает usage вовсе.
+            params["stream_options"] = {"include_usage": True}
+        return params
 
+    def _stream(self, params: dict) -> Iterator[StreamEvent]:
         accumulator = ToolCallAccumulator()
+        client, owned = self._request_client()
         try:
-            stream = self._client.chat.completions.create(**params)
+            stream = client.chat.completions.create(**params)
             for chunk in stream:
-                if getattr(chunk, "usage", None):
-                    yield StreamEvent(kind="usage", usage=_usage_to_dict(chunk.usage))
-                if not chunk.choices:
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    yield StreamEvent(kind="usage", usage=_usage_to_dict(usage))
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
                     continue
-                choice = chunk.choices[0]
-                if choice.finish_reason:
-                    yield StreamEvent(kind="finish", finish_reason=choice.finish_reason)
-                delta = choice.delta
+                choice = choices[0]
+                finish = getattr(choice, "finish_reason", None)
+                if finish:
+                    yield StreamEvent(kind="finish", finish_reason=str(finish))
+                delta = getattr(choice, "delta", None)
                 if delta is None:
                     continue
-                reasoning = getattr(delta, "reasoning_content", None)
+                reasoning = _reasoning_text(delta)
                 if reasoning:
                     yield StreamEvent(kind="reasoning", text=reasoning)
                 tool_deltas = getattr(delta, "tool_calls", None)
                 if tool_deltas:
                     accumulator.feed(tool_deltas)
-                if delta.content:
-                    yield StreamEvent(kind="content", text=delta.content)
+                content = getattr(delta, "content", None)
+                if content:
+                    yield StreamEvent(kind="content", text=str(content))
             for call in accumulator.finish():
                 yield StreamEvent(kind="tool_call", tool_call=call)
         except openai.AuthenticationError as exc:
-            raise DeepSeekError(
-                "DeepSeek отклонил ключ (401). Проверьте DEEPSEEK_API_KEY в .env."
+            raise LLMError(
+                f"{self.label} отклонил ключ (401). Проверьте {self.key_env} в .env.",
+                401,
             ) from exc
         except openai.PermissionDeniedError as exc:
-            raise DeepSeekError("У ключа нет доступа к этой модели (403).") from exc
+            raise LLMError(
+                f"У ключа нет доступа к модели «{self.model}» ({self.label}, 403).",
+                403,
+            ) from exc
+        except openai.NotFoundError as exc:
+            raise LLMError(
+                f"Модель «{self.model}» не найдена у {self.label} (404). "
+                "Проверьте алиас модели и адрес API.",
+                404,
+            ) from exc
         except openai.RateLimitError as exc:
-            raise DeepSeekError("Слишком много запросов к DeepSeek (429). Подождите немного.") from exc
+            raise LLMError(
+                f"Слишком много запросов к {self.label} (429). Подождите немного.",
+                429,
+            ) from exc
         except openai.APITimeoutError as exc:
-            raise DeepSeekError("DeepSeek не ответил вовремя. Попробуйте ещё раз.") from exc
+            raise LLMError(f"{self.label} не ответил вовремя. Попробуйте ещё раз.") from exc
         except openai.APIConnectionError as exc:
-            raise DeepSeekError(
-                "Нет связи с api.deepseek.com. Проверьте интернет, VPN или прокси."
+            raise LLMError(
+                f"Нет связи с {self.host}. Проверьте интернет, VPN или прокси."
+            ) from exc
+        except openai.BadRequestError as exc:
+            raise LLMError(
+                f"{self.label} отклонил запрос (400): {_api_message(exc)}",
+                400,
             ) from exc
         except openai.APIStatusError as exc:
             if exc.status_code == 402:
-                raise DeepSeekError(
-                    "На балансе DeepSeek закончились средства (402). "
-                    "Пополните счёт на platform.deepseek.com."
+                hint = (
+                    " Пополните счёт на platform.deepseek.com."
+                    if self.is_deepseek
+                    else ""
+                )
+                raise LLMError(
+                    f"На балансе {self.label} закончились средства (402).{hint}",
+                    402,
                 ) from exc
-            raise DeepSeekError(f"DeepSeek вернул ошибку {exc.status_code}: {exc.message}") from exc
+            raise LLMError(
+                f"{self.label} вернул ошибку {exc.status_code}: {_api_message(exc)}",
+                exc.status_code,
+            ) from exc
         except openai.APIError as exc:
-            raise DeepSeekError(f"Ошибка DeepSeek API: {exc}") from exc
+            raise LLMError(f"Ошибка {self.label} API: {exc}") from exc
         except Exception as exc:  # сеть может упасть как угодно, UI не должен падать
-            log.exception("Неожиданная ошибка при запросе к DeepSeek")
-            raise DeepSeekError(f"Не удалось получить ответ: {exc}") from exc
+            log.exception("Неожиданная ошибка при запросе к %s", self.label)
+            raise LLMError(f"Не удалось получить ответ: {exc}") from exc
+        finally:
+            if owned is not None:
+                try:
+                    owned.close()
+                except Exception:  # закрытие не должно прятать исходную ошибку
+                    pass
+
+
+# До 0.7.0 клиент умел только DeepSeek — старые имена оставляем рабочими.
+DeepSeekClient = ChatClient
+DeepSeekError = LLMError
+
+
+def _reasoning_text(delta: object) -> str:
+    """Рассуждения: у DeepSeek это `reasoning_content`, у других — `reasoning`."""
+    for name in ("reasoning_content", "reasoning"):
+        value = getattr(delta, name, None)
+        if value:
+            return str(value)
+    extra = getattr(delta, "model_extra", None)
+    if isinstance(extra, dict):
+        for name in ("reasoning_content", "reasoning"):
+            value = extra.get(name)
+            if value:
+                return str(value)
+    return ""
+
+
+def _api_message(exc: object) -> str:
+    """Текст ошибки от провайдера, а не «объект по такому-то адресу»."""
+    message = str(getattr(exc, "message", "") or "").strip()
+    return message or str(exc)
+
+
+def _clamp_int(value: object, default: int) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_float(value: object, minimum: float, maximum: float, default: float) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
 
 
 def _usage_to_dict(usage: object) -> dict:
-    """Приводим объект usage к обычному словарю."""
+    """Приводим объект usage к обычному словарю. Нет поля — считаем нулём."""
     return {
         "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
         "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
