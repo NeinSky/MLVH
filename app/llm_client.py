@@ -114,6 +114,7 @@ class ChatClient:
         base_url: str = "",
         thinking_style: str = "auto",
         key_env: str = "",
+        max_retries: int = 1,
     ) -> None:
         self.base_url = (base_url or "").strip().rstrip("/") or BASE_URL
         self.thinking_style = (thinking_style or "auto").strip().casefold()
@@ -124,6 +125,7 @@ class ChatClient:
         self.thinking = thinking
         self._api_key = api_key
         self._timeout = timeout
+        self._max_retries = max_retries
         # Некоторые локальные серверы не знают stream_options — выключаем после 400.
         self._stream_options = True
 
@@ -141,7 +143,7 @@ class ChatClient:
             api_key=api_key,
             base_url=self.base_url,
             timeout=timeout,
-            max_retries=1,
+            max_retries=max_retries,
         )
 
     # --- провайдер -------------------------------------------------------
@@ -187,14 +189,20 @@ class ChatClient:
         return DEFAULT_KEY_ENV if self.is_deepseek else "OPENAI_API_KEY"
 
     def thinking_payload(self) -> dict | None:
-        """`extra_body` для режима рассуждений; None — не отправлять."""
-        if not self.thinking:
-            return None
+        """`extra_body` для режима рассуждений; None — не отправлять.
+
+        Выключение просим явно: `deepseek-flash` — reasoning-модель, и без
+        параметра она думает по умолчанию. На коротком запросе это давало
+        пустой ответ за 13 с вместо JSON за 1 с (весь `max_tokens` уходил
+        в рассуждения). Другим провайдерам этот ключ не отправляем — они
+        отвечают на него 400.
+        """
+        deepseek_style = self.thinking_style == "deepseek" or self.is_deepseek
         if self.thinking_style == "none":
             return None
-        if self.thinking_style == "deepseek" or self.is_deepseek:
-            return {"thinking": {"type": "enabled"}}
-        return None
+        if self.thinking:
+            return {"thinking": {"type": "enabled"}} if deepseek_style else None
+        return {"thinking": {"type": "disabled"}} if deepseek_style else None
 
     def clone(self, *, thinking: bool | None = None, max_tokens: int | None = None) -> "ChatClient":
         """Копия клиента с другими параметрами — для повторного запроса."""
@@ -208,6 +216,7 @@ class ChatClient:
             base_url=self.base_url,
             thinking_style=self.thinking_style,
             key_env=self.key_env,
+            max_retries=self._max_retries,
         )
 
     def stream_chat(

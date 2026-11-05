@@ -28,7 +28,12 @@
     "silero_speaker": "baya",
     "silero_sample_rate": 48000,
     "silero_accent": true,
-    "silero_yo": true
+    "silero_yo": true,
+    "english_mode": "auto",
+    "english_voice": "en-US-AriaNeural",
+    "learn_terms": false,
+    "learn_timeout": 30.0,
+    "learn_fail_limit": 2
   },
   "asr": {
     "mode": "push",

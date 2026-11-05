@@ -22,3 +22,5 @@ latest_silero_models.yml
 *.tmp
 # рабочие заметки, не для распространения
 HANDOFF.md
+# словарь произношения, выученный моделью и правленный вручную
+speech_terms.local.json

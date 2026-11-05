@@ -40,17 +40,17 @@ SPEAKERS = {
 }
 
 
-def _download_model() -> Path:
+def _download_url(url: str, target: Path, min_bytes: int = 1_000_000) -> Path:
     """Качаем модель в папку проекта.
 
     У models.silero.ai просрочен сертификат, поэтому при ошибке проверки
     повторяем без неё — файл кладём только по HTTPS и предупреждаем в лог.
     """
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = MODEL_PATH.with_suffix(".part")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".part")
 
     def fetch(context: ssl.SSLContext) -> None:
-        request = urllib.request.Request(MODEL_URL, headers={"User-Agent": "MLVH"})
+        request = urllib.request.Request(url, headers={"User-Agent": "MLVH"})
         with urllib.request.urlopen(request, timeout=120, context=context) as response:
             with open(tmp, "wb") as handle:
                 while True:
@@ -79,12 +79,17 @@ def _download_model() -> Path:
             tmp.unlink(missing_ok=True)
             raise TTSError(f"Не удалось скачать модель Silero: {retry_exc}") from retry_exc
 
-    if not tmp.exists() or tmp.stat().st_size < 1_000_000:
+    if not tmp.exists() or tmp.stat().st_size < min_bytes:
         tmp.unlink(missing_ok=True)
         raise TTSError("Модель Silero скачалась не полностью — попробуйте ещё раз.")
 
-    tmp.replace(MODEL_PATH)
-    return MODEL_PATH
+    tmp.replace(target)
+    return target
+
+
+def _download_model() -> Path:
+    """Русская модель v5_ru (~139 МБ)."""
+    return _download_url(MODEL_URL, MODEL_PATH)
 
 
 class SileroEngine(TTSEngine):

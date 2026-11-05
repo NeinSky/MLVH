@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -21,7 +22,8 @@ import edge_tts
 from app.config import TTSSettings
 from app.engines.base import TTSError
 from app.engines.registry import get_engine
-from app.text_norm import normalize as normalize_ru
+from app.speech_parts import SpeechPart, build_parts, english_words, resolve_mode, transliterate_english
+from app.text_norm import has_cyrillic, has_latin, normalize as normalize_ru, split_by_script
 
 TMP_DIR = Path(tempfile.gettempdir()) / "mlvh_tts"
 CHUNK_CHARS = 400
@@ -61,9 +63,14 @@ def audio_seconds(path: Path) -> float:
         return 0.0
 
 
-def expected_seconds(text: str) -> float:
-    """Сколько примерно должна длиться речь: ~14 символов в секунду."""
-    return max(0.5, len(text) / 14.0)
+def expected_seconds(text: str, chars_per_second: float = 14.0) -> float:
+    """Сколько примерно должна длиться речь: ~14 символов в секунду.
+
+    Английский голос говорит быстрее (~18 символов в секунду), поэтому для
+    английских частей норму передаём отдельно — иначе проверка обрыва
+    приняла бы нормальный кусок за укороченный и дробила бы его зря.
+    """
+    return max(0.5, len(text) / max(1.0, chars_per_second))
 
 
 def clean_for_speech(text: str, normalize_numbers: bool = False) -> str:
@@ -88,8 +95,29 @@ def clean_for_speech(text: str, normalize_numbers: bool = False) -> str:
     text = re.sub(r"\s*\n\s*", " ", text)
     cleaned = _expand_acronyms(text.strip())
     if normalize_numbers:
-        cleaned = normalize_ru(cleaned)
+        cleaned = normalize_numbers_ru(cleaned)
     return cleaned
+
+
+def normalize_numbers_ru(text: str) -> str:
+    """Числа и сокращения — только в русских кусках.
+
+    Английский фрагмент уходит английскому голосу, и «100» в нём должно
+    остаться «100», а не превратиться в «сто». Пробелы по краям кусков
+    сохраняем: `normalize` их срезает, и слова слиплись бы в «Курспайтон».
+    """
+    if not has_latin(text):
+        return normalize_ru(text)
+
+    out: list[str] = []
+    for lang, chunk in split_by_script(text):
+        if lang == "en" or not chunk.strip():
+            out.append(chunk)
+            continue
+        lead = chunk[: len(chunk) - len(chunk.lstrip())]
+        tail = chunk[len(chunk.rstrip()):]
+        out.append(lead + normalize_ru(chunk.strip()) + tail)
+    return "".join(out)
 
 
 # Латиница без гласных («MLVH», «HTTP») не синтезируется: сервис возвращает тишину.
@@ -372,7 +400,8 @@ class TTSService:
     def speak(self, text: str, settings: TTSSettings) -> None:
         """Озвучиваем текст: синтез следующего куска идёт параллельно с речью."""
         self._stop.clear()
-        cleaned = clean_for_speech(text)[: max(200, settings.max_speak_chars)]
+        local = settings.engine in ("chatterbox", "silero")
+        cleaned = clean_for_speech(text, normalize_numbers=local)[: max(200, settings.max_speak_chars)]
         if not cleaned:
             return
 
@@ -387,7 +416,7 @@ class TTSService:
                     if index < len(chunks) and index not in futures:
                         path = TMP_DIR / f"chunk_{index:03d}_{uuid4().hex[:8]}.mp3"
                         futures[index] = pool.submit(
-                            self._synthesize_sync, chunks[index], path, settings
+                            self._speak_chunk, chunks[index], path, settings
                         )
 
                 submit(0)
@@ -397,18 +426,21 @@ class TTSService:
                     if self._stop.is_set():
                         break
                     try:
-                        path = futures.pop(index).result()
+                        paths = futures.pop(index).result()
                     except TTSError as exc:
                         # Один кусок не озвучился — не срываем всю фразу.
                         log.warning("Кусок %s не озвучен: %s", index, exc)
                         submit(index + 2)
                         continue
-                    created.append(path)
+                    created.extend(paths)
                     submit(index + 2)
                     if self._stop.is_set():
                         break
-                    self.play(path, settings.playback_volume)
-                    played += 1
+                    for path in paths:
+                        if self._stop.is_set():
+                            break
+                        self.play(path, settings.playback_volume)
+                        played += 1
 
                 if played == 0 and not self._stop.is_set():
                     # Edge не дал звука — читаем голосом Windows, он всегда под рукой.
@@ -420,6 +452,25 @@ class TTSService:
                     path.unlink(missing_ok=True)
                 except OSError:
                     pass  # файл ещё держит плеер — удалим при следующем запуске
+
+    def _speak_chunk(self, text: str, path: Path, settings: TTSSettings) -> list[Path]:
+        """Кусок целиком: русские части — выбранным движком, английские — по режиму."""
+        parts = build_parts(text, settings)
+        result: list[Path] = []
+        for index, part in enumerate(parts):
+            part_path = path
+            if len(parts) > 1:
+                part_path = path.with_name(f"{path.stem}_{index}{path.suffix}")
+            if part.lang == "en":
+                paths = synthesize_english(self, part.text, part_path, settings)
+                if not paths:
+                    fallback = transliterate_english(part.text)
+                    if fallback.strip():
+                        paths = [self._synthesize_sync(fallback, part_path, settings)]
+            else:
+                paths = [self._synthesize_sync(part.text, part_path, settings)]
+            result.extend(paths)
+        return result
 
     def _speak_sapi(self, text: str) -> None:
         """Запасной голос Windows (SAPI): офлайн, звучит проще, но всегда доступен."""
@@ -511,6 +562,43 @@ class TTSService:
         shutil.rmtree(TMP_DIR, ignore_errors=True)
 
 
+def synthesize_english(
+    tts: TTSService, text: str, path: Path, settings: TTSSettings
+) -> list[Path]:
+    """Английский фрагмент: локальная v3_en, иначе Edge английским голосом.
+
+    Пустой список означает «не получилось» — вызывающий решает, читать ли
+    фрагмент транслитом.
+    """
+    if resolve_mode(settings) == "silero_en":
+        local = _synthesize_silero_en(text, path, settings)
+        if local:
+            return local
+
+    english = replace(settings, engine="edge", voice=settings.english_voice)
+    try:
+        return [tts._synthesize_sync(text, path, english)]
+    except TTSError as exc:
+        log.warning("Английский фрагмент не озвучен: %s", exc)
+        return []
+
+
+def _synthesize_silero_en(text: str, path: Path, settings: TTSSettings) -> list[Path]:
+    """Локальная английская модель; пустой список — режим недоступен."""
+    try:
+        from app.engines.silero_en_engine import SileroEnEngine
+    except Exception:
+        return []
+    engine = SileroEnEngine.instance()
+    if not engine.probe().available:
+        return []
+    try:
+        return [engine.synthesize(text, path.with_suffix(".wav"), settings)]
+    except TTSError as exc:
+        log.warning("Silero v3_en не справился: %s", exc)
+        return []
+
+
 class SpeechPipeline:
     """Озвучка по мере поступления текста.
 
@@ -526,6 +614,7 @@ class SpeechPipeline:
         on_done=None,
         on_error=None,
         on_note=None,
+        model_settings=None,
     ) -> None:
         self._tts = tts
         self._settings = settings
@@ -542,6 +631,21 @@ class SpeechPipeline:
         self._chars = 0
         self._closed = False
         self._threads: list[threading.Thread] = []
+        self._wait_terms = False       # первый кусок ждёт словарь
+        self._learner = self._make_learner(model_settings)
+
+    def _make_learner(self, model_settings):
+        """Обучение терминов — только явным флагом и только если есть провайдер."""
+        if model_settings is None or not getattr(self._settings, "learn_terms", False):
+            return None
+        try:
+            # Импорт внутри: без обучения тянуть openai и клиент модели незачем.
+            from app.speech_learn import TermLearner
+
+            return TermLearner(model_settings, self._settings, on_note=self._on_note)
+        except Exception as exc:          # сеть и ключи проверяются позже, при запросе
+            log.warning("Обучение терминов не включилось: %s", exc)
+            return None
 
     # --- управление -----------------------------------------------------
     def start(self) -> None:
@@ -565,7 +669,26 @@ class SpeechPipeline:
         self._chars += len(text)
         self._spoken.append(text)
         for chunk in self._buffer.push(text):
+            self._request_terms(chunk)
             self._texts.put(chunk)
+
+    def _request_terms(self, chunk: str) -> None:
+        """Просим словарь о незнакомых словах — сразу, параллельно с синтезом.
+
+        Запрос идёт в фоне: ждать его будем только перед первым куском и не
+        дольше `learn_timeout`. Если слова нет и не выучилось — прочитаем
+        по правилам, слово останется на следующий раз.
+        """
+        if self._learner is None or not self._learner.enabled:
+            return
+        try:
+            words = english_words(chunk)
+        except Exception as exc:
+            log.warning("Не удалось собрать незнакомые термины: %s", exc)
+            return
+        if words:
+            self._wait_terms = True
+            self._learner.request(words)
 
     def finish(self) -> None:
         """Ответ закончился: отдаём остаток и ждём, пока всё проиграется."""
@@ -629,10 +752,17 @@ class SpeechPipeline:
 
     def _synthesize_loop(self) -> None:
         index = 0
+        first = True
         while not self._stop.is_set():
             text = self._texts.get()
             if text is None or self._stop.is_set():
                 break
+
+            if first:
+                # Словарь спрашиваем один раз за ответ: ждём не дольше лимита,
+                # дальше читаем тем, что успело появиться.
+                self._await_terms()
+                first = False
 
             path = TMP_DIR / f"stream_{index:03d}_{uuid4().hex[:8]}.mp3"
             cleaned = clean_for_speech(text, normalize_numbers=self._local_engine())
@@ -641,20 +771,65 @@ class SpeechPipeline:
                 index += 1
                 continue
 
-            ready_paths = self._synthesize_chunk(cleaned, path)
-            self._ready.put((index, ready_paths))
+            ready: list[Path] = []
+            parts = build_parts(cleaned, self._settings)
+            for part_index, part in enumerate(parts):
+                if self._stop.is_set():
+                    break
+                part_path = path
+                if len(parts) > 1:
+                    part_path = path.with_name(f"{path.stem}_{part_index}{path.suffix}")
+                ready.extend(self._synthesize_part(part, part_path))
+            self._ready.put((index, ready))
             index += 1
         self._ready.put((-1, None))
 
-    def _synthesize_chunk(self, text: str, path: Path, depth: int = 0) -> list[Path]:
+    def _await_terms(self) -> None:
+        """Ждём обучения не дольше `learn_timeout`, потом читаем как есть."""
+        if self._learner is None or not self._wait_terms:
+            return
+        timeout = max(1.0, float(getattr(self._settings, "learn_timeout", 30.0)))
+        started = time.monotonic()
+        self._learner.wait(timeout)
+        spent = time.monotonic() - started
+        if spent >= timeout:
+            log.warning("Словарь не ответил за %.0f с — читаю по правилам", timeout)
+            self._note("Термины не выучены вовремя — прочитаю по правилам")
+
+    def _synthesize_part(self, part: SpeechPart, path: Path) -> list[Path]:
+        """Одна часть: английскую отдаём английскому движку, русскую — обычному."""
+        if part.lang != "en":
+            return self._synthesize_chunk(part.text, path)
+
+        paths = synthesize_english(self._tts, part.text, path, self._settings)
+        if paths:
+            return paths
+
+        # Английский движок не дал звука — переписываем кириллицей, чтобы
+        # слова не пропали совсем (так было до 0.8).
+        fallback = transliterate_english(part.text)
+        if fallback.strip():
+            self._note("Английский фрагмент читаю русскими буквами")
+            return self._synthesize_chunk(fallback, path)
+        return []
+
+    def _synthesize_chunk(
+        self,
+        text: str,
+        path: Path,
+        depth: int = 0,
+        settings: TTSSettings | None = None,
+    ) -> list[Path]:
         """Синтез куска; при обрыве дробим текст и синтезируем половинки."""
-        want = expected_seconds(text)
+        active = settings or self._settings
+        # Английский голос говорит быстрее: своя норма для проверки обрыва.
+        want = expected_seconds(text, 18.0 if not has_cyrillic(text) else 14.0)
         result: Path | None = None
 
         # Повторяем только при ошибке синтеза; обрыв лечится дроблением текста.
         for attempt in (1, 2):
             try:
-                result = self._tts._synthesize_sync(text, path, self._settings)
+                result = self._tts._synthesize_sync(text, path, active)
                 break
             except TTSError as exc:
                 log.warning("Кусок не озвучен (попытка %s): %s", attempt, exc)
@@ -682,7 +857,7 @@ class SpeechPipeline:
             paths: list[Path] = []
             for index, part in enumerate(halves):
                 part_path = path.with_name(f"{path.stem}_p{index}{path.suffix}")
-                paths.extend(self._synthesize_chunk(part, part_path, depth + 1))
+                paths.extend(self._synthesize_chunk(part, part_path, depth + 1, active))
             if paths:
                 return paths
 
@@ -733,6 +908,14 @@ class SpeechPipeline:
                         except OSError:
                             pass
         finally:
+            # Выученные термины пишем сразу: файл маленький, а при выходе
+            # отложенная запись потерялась бы.
+            try:
+                from app.speech_terms import dictionary
+
+                dictionary().flush(force=True)
+            except Exception:
+                pass
             if self._played == 0 and not self._stop.is_set() and self._spoken:
                 # Edge не дал звука ни разу — читаем голосом Windows.
                 log.warning("Edge TTS молчит, переключаюсь на SAPI")

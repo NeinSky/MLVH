@@ -383,7 +383,14 @@ def test_llm_client() -> None:
                        thinking_style="none")
     check("style none выключает", muted.thinking_payload() is None)
     quiet = ChatClient(api_key="k", model="deepseek-flash", thinking=False)
-    check("выключенные рассуждения молчат", quiet.thinking_payload() is None)
+    # DeepSeek просим выключить явно: иначе модель думает по умолчанию и
+    # возвращает пустой ответ (13 с и ни одного символа в content).
+    check("выключенные рассуждения просят disable",
+          quiet.thinking_payload() == {"thinking": {"type": "disabled"}},
+          str(quiet.thinking_payload()))
+    check("чужому провайдеру disable не отправляем",
+          ChatClient(api_key="k", model="gpt", thinking=False,
+                     base_url="https://openrouter.ai/api/v1").thinking_payload() is None)
 
     check("температура зажата", ChatClient(api_key="k", temperature=9).temperature == 2.0)
     check("max_tokens снизу 1", ChatClient(api_key="k", max_tokens=0).max_tokens == 1)
@@ -527,6 +534,13 @@ def test_example_config() -> None:
     check("активный характер есть в списке", data.get("active_persona") in ids,
           str(data.get("active_persona")))
     check("нет ключа", "sk-" not in path.read_text(encoding="utf-8"))
+    tts_example = data.get("tts") or {}
+    check("английский режим в примере", tts_example.get("english_mode") == "auto",
+          str(tts_example.get("english_mode")))
+    check("обучение терминов в примере выключено",
+          tts_example.get("learn_terms") is False, str(tts_example.get("learn_terms")))
+    check("ожидание словаря в примере — 30 с",
+          tts_example.get("learn_timeout") == 30.0, str(tts_example.get("learn_timeout")))
 
 
 def test_asr_settings() -> None:
@@ -1924,6 +1938,174 @@ def test_version() -> None:
           versions == sorted(versions, key=_version_key, reverse=True), str(versions))
 
 
+def test_speech_terms() -> None:
+    print("словарь произношения:")
+    from app.speech_terms import TermDictionary, is_valid_pronunciation, normalize_key
+
+    check("ключ без регистра и разделителей",
+          normalize_key("Node.js") == normalize_key("node js") == normalize_key("NODE-JS"),
+          normalize_key("Node.js"))
+    check("латиница в произношении не годится",
+          not is_valid_pronunciation("kubernetes"))
+    check("пустое не годится", not is_valid_pronunciation("   "))
+    check("кириллица годится", is_valid_pronunciation("кубернетес"))
+
+    folder = Path(tempfile.mkdtemp(prefix="mlvh_terms_"))
+    core = folder / "core.json"
+    local = folder / "local.json"
+    core.write_text(
+        json.dumps({"schema": 1, "entries": {
+            "python": "пайтон",
+            "pull request": "пулл реквест",
+        }}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    terms = TermDictionary(core_path=core, local_path=local).load()
+    check("слово из поставляемого слоя", terms.lookup("Python") == "пайтон",
+          str(terms.lookup("Python")))
+    check("фраза находится целиком", terms.lookup("pull request") == "пулл реквест",
+          str(terms.lookup("pull request")))
+    check("незнакомое слово не находится", terms.lookup("kubernetes") is None)
+    check("фраза побеждает отдельные слова",
+          terms.apply_phrases("сделай pull request сейчас") == "сделай пулл реквест сейчас",
+          terms.apply_phrases("сделай pull request сейчас"))
+
+    check("выучили слово", terms.remember("kubernetes", "кубернетес"))
+    check("выученное находится", terms.lookup("kubernetes") == "кубернетес")
+    check("негодный ответ не сохраняем",
+          terms.remember("rust", "rust") is False)
+    check("локальный слой перекрывает поставляемый",
+          terms.remember("python", "пайтонн") and terms.lookup("python") == "пайтонн")
+
+    terms.flush(force=True)
+    saved = json.loads(local.read_text(encoding="utf-8"))
+    check("локальный файл записан", "kubernetes" in saved.get("entries", {}),
+          str(list(saved.get("entries", {}))))
+
+    terms.reject("nginx")
+    check("отказ запоминается", terms.is_rejected("nginx"))
+    check("отказанное не предлагаем учить",
+          terms.missing("Docker на nginx") == ["Docker"],
+          str(terms.missing("Docker на nginx")))
+
+
+def test_transliterate() -> None:
+    print("транслит английских слов:")
+    from app.text_norm import is_probable_code, split_by_script, transliterate_word
+
+    check("слово по правилам", transliterate_word("Kubernetes") == "кубернетес",
+          transliterate_word("Kubernetes"))
+    check("CamelCase делится", transliterate_word("JavaScript") == "джаваскрипт",
+          transliterate_word("JavaScript"))
+    check("аббревиатура читается по буквам", transliterate_word("API") == "эй пи ай",
+          transliterate_word("API"))
+    check("буквы в CamelCase тоже буквы", transliterate_word("gRPC") == "джи ар пи си",
+          transliterate_word("gRPC"))
+    check("немая «e» делает гласную долгой", transliterate_word("Vite") == "вайт",
+          transliterate_word("Vite"))
+    check("куски по алфавиту",
+          split_by_script("Курс Python — это язык")
+          == [("ru", "Курс "), ("en", "Python — "), ("ru", "это язык")],
+          str(split_by_script("Курс Python — это язык")))
+    check("имя файла не читаем", is_probable_code("config.json") and is_probable_code("v1.2.3"))
+    check("обычное слово читаем", not is_probable_code("Docker"))
+
+
+def test_speech_learn() -> None:
+    print("обучение терминов:")
+    from app.config import ModelSettings, TTSSettings
+    from app.llm_client import LLMError
+    from app.speech_learn import TermLearner, parse_answer
+
+    check("JSON в обёртке из ```",
+          parse_answer('```json\n{"Python": "пайтон"}\n```') == {"python": "пайтон"},
+          str(parse_answer('```json\n{"Python": "пайтон"}\n```')))
+    check("текст вокруг JSON не мешает",
+          parse_answer('вот: {"GPT": "джи пи ти"} готово') == {"gpt": "джи пи ти"})
+
+    try:
+        parse_answer("никакого JSON")
+        check("мусор без JSON отбраковывается", False)
+    except ValueError:
+        check("мусор без JSON отбраковывается", True)
+
+    notes: list[str] = []
+    settings = TTSSettings()
+    settings.learn_terms = True
+    settings.learn_fail_limit = 2
+    learner = TermLearner(ModelSettings(), settings, on_note=notes.append)
+    check("обучение включается флагом", learner.enabled)
+
+    import logging
+
+    noisy = logging.getLogger("app.speech_learn")
+    was_disabled = noisy.disabled
+    noisy.disabled = True          # тест намеренно валит запросы: не сорим в stderr
+
+    def no_network(_words):
+        raise LLMError("нет сети")
+
+    learner._ask = no_network      # сеть не нужна: проверяем предохранитель
+    try:
+        learner.request(["zzz-one"])
+        learner.wait(10)
+        learner.request(["zzz-two"])
+        learner.wait(10)
+    finally:
+        noisy.disabled = was_disabled
+    check("после двух неудач обучение выключается", not learner.enabled)
+    check("пользователю сказали, почему", any("выключено" in note for note in notes),
+          str(notes))
+
+    off = TTSSettings()
+    check("по умолчанию обучение выключено", not off.learn_terms)
+    check("таймаут по умолчанию 30 с", off.learn_timeout == 30.0, str(off.learn_timeout))
+
+
+def test_speech_parts() -> None:
+    print("части по языку:")
+    from app.config import TTSSettings
+    from app.speech_parts import build_parts
+
+    base = TTSSettings()
+    parts = build_parts("Курс Python — это язык.", base)
+    check("короткая вставка остаётся в русском голосе",
+          len(parts) == 1 and parts[0].lang == "ru", str(parts))
+    check("слово переписано кириллицей", "пайтон" in parts[0].text,
+          parts[0].text if parts else "")
+
+    parts = build_parts("Hello world, how are you today my friend?", base)
+    check("длинная английская фраза уходит английскому голосу",
+          bool(parts) and parts[0].lang == "en", str(parts))
+
+    edge = TTSSettings(**{**base.__dict__, "english_mode": "edge"})
+    parts = build_parts("Открой pull request в GitHub.", edge)
+    check("режим edge отдаёт фразу английскому голосу",
+          any(part.lang == "en" for part in parts), str(parts))
+    check("одно короткое слово в edge остаётся русским",
+          build_parts("Курс Python — это язык.", edge)[0].lang == "ru",
+          str(build_parts("Курс Python — это язык.", edge)))
+
+    translit = TTSSettings(**{**base.__dict__, "english_mode": "translit"})
+    parts = build_parts("Hello world, how are you today my friend?", translit)
+    check("режим translit переводит всё в кириллицу",
+          len(parts) == 1 and parts[0].lang == "ru" and not any(
+              char.isascii() and char.isalpha() for char in parts[0].text),
+          parts[0].text if parts else "")
+
+    off = TTSSettings(**{**base.__dict__, "english_mode": "off"})
+    parts = build_parts("Курс Python — это язык.", off)
+    check("режим off ничего не меняет",
+          len(parts) == 1 and "Python" in parts[0].text, str(parts))
+
+    broken = TTSSettings.from_dict({"english_mode": "чепуха", "learn_timeout": 9999})
+    check("неизвестный режим — это auto", broken.english_mode == "auto",
+          broken.english_mode)
+    check("таймаут обучения ограничен сверху", broken.learn_timeout == 300.0,
+          str(broken.learn_timeout))
+
+
 def _version_key(value: str) -> tuple[int, ...]:
     return tuple(int(part) for part in value.split("."))
 
@@ -1955,6 +2137,10 @@ def main() -> int:
         test_core_without_qt,
         test_version,
         test_audio_helpers,
+        test_speech_terms,
+        test_transliterate,
+        test_speech_learn,
+        test_speech_parts,
         test_example_config,
     ):
         try:

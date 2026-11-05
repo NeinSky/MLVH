@@ -64,6 +64,10 @@ from app.config import (
     ASR_MODE_TITLES,
     AVAILABLE_MODELS,
     BASE_DIR,
+    ENGLISH_MODES,
+    ENGLISH_MODE_HINTS,
+    ENGLISH_MODE_TITLES,
+    ENGLISH_VOICES,
     FALLBACK_VOICES,
     Settings,
     get_api_key,
@@ -109,25 +113,26 @@ QTextBrowser#Chat {
     padding: 10px; font-size: 14px;
 }
 QGroupBox {
-    border: 1px solid #1f2937; border-radius: 10px; margin-top: 14px; padding-top: 8px;
+    border: 1px solid #1f2937; border-radius: 10px; margin-top: 12px; padding-top: 6px;
     font-weight: 600; color: #cbd5e1;
 }
 QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
 QLineEdit {
     background: #0b1220; border: 1px solid #1f2937; border-radius: 8px;
-    padding: 8px 10px; font-size: 14px;
+    padding: 6px 9px; font-size: 14px;
 }
 QLineEdit:focus { border-color: #3b82f6; }
 QPushButton {
-    background: #1f2937; border: 1px solid #334155; border-radius: 8px;
-    padding: 7px 12px; color: #e5e7eb;
+    background: #1f2937; border: 1px solid #334155; border-radius: 7px;
+    padding: 4px 9px; font-size: 13px; color: #e5e7eb;
 }
 QPushButton:hover { background: #273449; }
 QPushButton:disabled { color: #64748b; border-color: #1f2937; }
 QPushButton#Primary { background: #2563eb; border-color: #2563eb; color: white; font-weight: 600; }
 QPushButton#Primary:hover { background: #1d4ed8; }
 QComboBox, QSpinBox {
-    background: #0b1220; border: 1px solid #1f2937; border-radius: 8px; padding: 5px 8px;
+    background: #0b1220; border: 1px solid #1f2937; border-radius: 8px;
+    padding: 3px 8px; font-size: 13px;
 }
 QListWidget {
     background: #0b1220; border: 1px solid #1f2937; border-radius: 8px; padding: 4px;
@@ -140,7 +145,7 @@ QSlider::handle:horizontal {
 }
 QCheckBox { color: #cbd5e1; }
 QStatusBar { color: #9ca3af; }
-QPushButton#Mic { min-width: 32px; padding: 5px 6px; font-size: 16px; }
+QPushButton#Mic { min-width: 30px; padding: 3px 6px; font-size: 15px; }
 QPushButton#Mic[state="recording"] { background: #b91c1c; border-color: #ef4444; }
 QPushButton#Mic[state="busy"] { background: #b45309; border-color: #f59e0b; }
 """
@@ -255,6 +260,8 @@ class MainWindow(QMainWindow):
         # Локальные модели грузятся заранее: Chatterbox ~20 с, Silero ~4 с.
         if self.settings.tts.engine in ("chatterbox", "silero"):
             self._warm_up_engine(self.settings.tts.engine)
+        if self.settings.tts.english_mode == "silero_en":
+            self._warm_up_english()
 
     # --- сборка интерфейса ---------------------------------------------
     def _build_ui(self) -> None:
@@ -353,6 +360,8 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        # Панель узкая: длинные подписи переносим, а не растим окно вбок.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setMinimumWidth(300)
         scroll.setMaximumWidth(380)
 
@@ -360,15 +369,16 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(holder)
         layout.setContentsMargins(0, 0, 6, 0)
         layout.setSpacing(6)
+        self._row_labels: list[QLabel] = []   # подписи строк «Голос»: выровняем в конце
 
         persona_box = QGroupBox("Характер")
         persona_layout = QVBoxLayout(persona_box)
         self.persona_combo = QComboBox()
-        self.persona_combo.setMinimumWidth(200)
+        self.persona_combo.setMinimumWidth(170)
         self.persona_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        self.persona_combo.setMinimumContentsLength(14)
+        self.persona_combo.setMinimumContentsLength(9)
         self.persona_combo.currentIndexChanged.connect(self._on_persona_changed)
         persona_layout.addWidget(self.persona_combo)
 
@@ -399,11 +409,11 @@ class MainWindow(QMainWindow):
 
         voice_layout.addWidget(QLabel("Движок:"))
         self.engine_combo = QComboBox()
-        self.engine_combo.setMinimumWidth(200)
+        self.engine_combo.setMinimumWidth(170)
         self.engine_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        self.engine_combo.setMinimumContentsLength(14)
+        self.engine_combo.setMinimumContentsLength(9)
         self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
         voice_layout.addWidget(self.engine_combo)
 
@@ -428,11 +438,11 @@ class MainWindow(QMainWindow):
 
         voice_layout.addWidget(QLabel("Голос:"))
         self.voice_combo = QComboBox()
-        self.voice_combo.setMinimumWidth(200)
+        self.voice_combo.setMinimumWidth(170)
         self.voice_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        self.voice_combo.setMinimumContentsLength(14)
+        self.voice_combo.setMinimumContentsLength(9)
         self.voice_combo.currentIndexChanged.connect(self._on_voice_changed)
         voice_layout.addWidget(self.voice_combo)
 
@@ -460,8 +470,9 @@ class MainWindow(QMainWindow):
         )
 
         self.silero_row = QHBoxLayout()
-        self.silero_label = QLabel("Голос Silero:")
-        self.silero_label.setFixedWidth(78)
+        self.silero_label = QLabel("Silero:")
+        self.silero_label.setToolTip("Голос локальной модели Silero")
+        self._row_labels.append(self.silero_label)
         self.silero_combo = QComboBox()
         for key, title in SILERO_SPEAKERS.items():
             self.silero_combo.addItem(title, key)
@@ -469,6 +480,65 @@ class MainWindow(QMainWindow):
         self.silero_row.addWidget(self.silero_label)
         self.silero_row.addWidget(self.silero_combo, 1)
         voice_layout.addLayout(self.silero_row)
+
+        english_row = QHBoxLayout()
+        self.english_label = QLabel("Англ.:")
+        self.english_label.setToolTip("Что делать с английскими словами в ответе")
+        self._row_labels.append(self.english_label)
+        self.english_mode_combo = QComboBox()
+        self.english_mode_combo.setMinimumWidth(170)
+        self.english_mode_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.english_mode_combo.setMinimumContentsLength(9)
+        for mode in ENGLISH_MODES:
+            self.english_mode_combo.addItem(ENGLISH_MODE_TITLES[mode], mode)
+            self.english_mode_combo.setItemData(
+                self.english_mode_combo.count() - 1,
+                ENGLISH_MODE_HINTS.get(mode, ""),
+                Qt.ItemDataRole.ToolTipRole,
+            )
+        self.english_mode_combo.setToolTip(
+            "Что делать с английскими словами в ответе.\n"
+            "Silero и Chatterbox латиницу не читают и молча выкидывают слова,\n"
+            "поэтому их либо переписываем русскими буквами (голос не меняется),\n"
+            "либо отдаём английскому голосу."
+        )
+        self.english_mode_combo.currentIndexChanged.connect(self._on_english_mode)
+        english_row.addWidget(self.english_label)
+        english_row.addWidget(self.english_mode_combo, 1)
+        voice_layout.addLayout(english_row)
+
+        english_voice_row = QHBoxLayout()
+        self.english_voice_label = QLabel("EN:")
+        self.english_voice_label.setToolTip("Голос Edge для английских фрагментов")
+        self._row_labels.append(self.english_voice_label)
+        self.english_voice_combo = QComboBox()
+        self.english_voice_combo.setEditable(True)   # можно вписать любой голос Edge
+        self.english_voice_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.english_voice_combo.setMinimumContentsLength(9)
+        self.english_voice_combo.addItems(ENGLISH_VOICES)
+        self.english_voice_combo.setToolTip(
+            "Голос Edge для английских фрагментов. Вписать можно любой ShortName "
+            "из списка голосов Edge, например en-US-AriaNeural."
+        )
+        self.english_voice_combo.currentTextChanged.connect(self._on_english_voice)
+        english_voice_row.addWidget(self.english_voice_label)
+        english_voice_row.addWidget(self.english_voice_combo, 1)
+        voice_layout.addLayout(english_voice_row)
+
+        self.learn_terms_check = QCheckBox("Учить новые термины")
+        self.learn_terms_check.setToolTip(
+            "Незнакомые английские слова спрашиваем у модели и запоминаем в "
+            "speech_terms.local.json.\n"
+            "Это запросы к провайдеру, за которые платятся токены, а ответ может "
+            "задержаться до 30 с — поэтому выключено по умолчанию.\n"
+            "Без обучения незнакомые слова читаются по правилам."
+        )
+        self.learn_terms_check.toggled.connect(self._on_learn_terms)
+        voice_layout.addWidget(self.learn_terms_check)
 
         chars_row = QHBoxLayout()
         chars_row.addWidget(QLabel("Читать:"))
@@ -505,11 +575,11 @@ class MainWindow(QMainWindow):
         mic_layout.addWidget(self.mic_mode_combo)
 
         self.asr_engine_combo = QComboBox()
-        self.asr_engine_combo.setMinimumWidth(200)
+        self.asr_engine_combo.setMinimumWidth(170)
         self.asr_engine_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        self.asr_engine_combo.setMinimumContentsLength(14)
+        self.asr_engine_combo.setMinimumContentsLength(9)
         self.asr_engine_combo.currentIndexChanged.connect(self._on_asr_engine_changed)
         mic_layout.addWidget(self.asr_engine_combo)
 
@@ -530,7 +600,9 @@ class MainWindow(QMainWindow):
         hotkey_row.addWidget(self.hotkey_edit, 1)
         mic_layout.addLayout(hotkey_row)
 
-        self.global_hotkey_check = QCheckBox("Регистрировать нажатия глобально")
+        # Подписи короткие: чекбокс не переносит текст, длинная строка
+        # распирает боковую панель. Подробности — в подсказке.
+        self.global_hotkey_check = QCheckBox("Глобальная клавиша")
         self.global_hotkey_check.setToolTip(
             "Работает, даже когда окно MLVH не в фокусе.\n"
             "Глобально Windows отдаёт только нажатие, поэтому запись "
@@ -539,7 +611,11 @@ class MainWindow(QMainWindow):
         self.global_hotkey_check.toggled.connect(self._on_global_hotkey)
         mic_layout.addWidget(self.global_hotkey_check)
 
-        self.auto_send_check = QCheckBox("Отправлять сразу после распознавания")
+        self.auto_send_check = QCheckBox("Отправлять сразу")
+        self.auto_send_check.setToolTip(
+            "Отправлять вопрос модели сразу после распознавания, "
+            "не дожидаясь правки в поле ввода."
+        )
         self.auto_send_check.toggled.connect(self._on_auto_send)
         mic_layout.addWidget(self.auto_send_check)
 
@@ -583,7 +659,7 @@ class MainWindow(QMainWindow):
         self.agent_read_check.toggled.connect(self._on_agent_read)
         agent_layout.addWidget(self.agent_read_check)
 
-        self.agent_web_check = QCheckBox("Интернет: поиск и чтение страниц")
+        self.agent_web_check = QCheckBox("Интернет")
         self.agent_web_check.setToolTip(
             "Разрешить агенту искать в интернете (DuckDuckGo) и открывать страницы.\n"
             "Страницы на JavaScript отрисовываются в Chrome.\n"
@@ -592,7 +668,7 @@ class MainWindow(QMainWindow):
         self.agent_web_check.toggled.connect(self._on_agent_web)
         agent_layout.addWidget(self.agent_web_check)
 
-        self.agent_mcp_check = QCheckBox("MCP-серверы (внешние инструменты)")
+        self.agent_mcp_check = QCheckBox("MCP-серверы")
         self.agent_mcp_check.setToolTip(
             "Разрешить агенту вызывать инструменты MCP-серверов из config.json.\n"
             "MCP-сервер — отдельная программа на вашем компьютере: папками агента\n"
@@ -617,24 +693,29 @@ class MainWindow(QMainWindow):
         )
         agent_layout.addWidget(self.agent_mcp_servers)
 
+        # Две строки по две кнопки: четыре в ряд не влезали в панель 314 px.
         mcp_buttons = QHBoxLayout()
+        mcp_buttons.setSpacing(4)
         self.add_mcp_server_button = QPushButton("Добавить…")
         self.add_mcp_server_button.clicked.connect(self._add_mcp_server)
         self.edit_mcp_server_button = QPushButton("Изменить…")
         self.edit_mcp_server_button.clicked.connect(self._edit_mcp_server)
-        self.remove_mcp_server_button = QPushButton("Удалить")
-        self.remove_mcp_server_button.clicked.connect(self._remove_mcp_server)
         mcp_buttons.addWidget(self.add_mcp_server_button)
         mcp_buttons.addWidget(self.edit_mcp_server_button)
-        mcp_buttons.addWidget(self.remove_mcp_server_button)
         agent_layout.addLayout(mcp_buttons)
 
-        self.probe_mcp_server_button = QPushButton("Проверить сервер…")
+        mcp_buttons_2 = QHBoxLayout()
+        mcp_buttons_2.setSpacing(4)
+        self.remove_mcp_server_button = QPushButton("Удалить")
+        self.remove_mcp_server_button.clicked.connect(self._remove_mcp_server)
+        self.probe_mcp_server_button = QPushButton("Проверить…")
         self.probe_mcp_server_button.setToolTip(
             "Запустить выбранный сервер и показать, сколько инструментов он отдал."
         )
         self.probe_mcp_server_button.clicked.connect(self._probe_mcp_server)
-        agent_layout.addWidget(self.probe_mcp_server_button)
+        mcp_buttons_2.addWidget(self.remove_mcp_server_button)
+        mcp_buttons_2.addWidget(self.probe_mcp_server_button)
+        agent_layout.addLayout(mcp_buttons_2)
 
         self.agent_roots = QListWidget()
         self.agent_roots.setMaximumHeight(92)
@@ -643,7 +724,8 @@ class MainWindow(QMainWindow):
         agent_layout.addWidget(self.agent_roots)
 
         agent_buttons = QHBoxLayout()
-        self.add_agent_root_button = QPushButton("Добавить папку…")
+        self.add_agent_root_button = QPushButton("Добавить…")
+        self.add_agent_root_button.setToolTip("Добавить папку, которую агенту можно читать")
         self.add_agent_root_button.clicked.connect(self._add_agent_root)
         self.remove_agent_root_button = QPushButton("Удалить")
         self.remove_agent_root_button.clicked.connect(self._remove_agent_root)
@@ -681,6 +763,20 @@ class MainWindow(QMainWindow):
         layout.addWidget(hint)
         layout.addStretch()
 
+        # Поля внутри групп поджимаем: панель узкая, а отступы по умолчанию
+        # съедают ширину, из-за которой появлялся горизонтальный ползунок.
+        for box in holder.findChildren(QGroupBox):
+            box_layout = box.layout()
+            if box_layout is not None:
+                box_layout.setContentsMargins(6, 5, 6, 5)
+
+        # Подписи строк выравниваем по самой длинной, но не шире 110 px:
+        # иначе «Громкость» и «Похожесть» обрезались, а ползунки стояли криво.
+        if self._row_labels:
+            width = min(110, max(label.sizeHint().width() for label in self._row_labels))
+            for label in self._row_labels:
+                label.setFixedWidth(width)
+
         scroll.setWidget(holder)
         return scroll
 
@@ -697,14 +793,15 @@ class MainWindow(QMainWindow):
         """Строка «подпись — ползунок — значение»."""
         row = QHBoxLayout()
         label = QLabel(title)
-        label.setFixedWidth(78)
+        self._row_labels.append(label)
 
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(minimum, maximum)
         slider.setValue(value)
+        slider.setMinimumWidth(60)
 
         value_label = QLabel("")
-        value_label.setFixedWidth(56)
+        value_label.setFixedWidth(72)
         value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         def fmt(raw: int) -> str:
@@ -735,6 +832,9 @@ class MainWindow(QMainWindow):
             self.agent_mcp_check,
             self.agent_rounds_spin,
             self.agent_mcp_servers,
+            self.english_mode_combo,
+            self.english_voice_combo,
+            self.learn_terms_check,
         ):
             widget.blockSignals(True)
         self._refresh_provider_ui()
@@ -757,6 +857,9 @@ class MainWindow(QMainWindow):
             self.agent_mcp_check,
             self.agent_rounds_spin,
             self.agent_mcp_servers,
+            self.english_mode_combo,
+            self.english_voice_combo,
+            self.learn_terms_check,
         ):
             widget.blockSignals(False)
 
@@ -771,6 +874,12 @@ class MainWindow(QMainWindow):
             self.silero_combo.blockSignals(True)
             self.silero_combo.setCurrentIndex(silero_index)
             self.silero_combo.blockSignals(False)
+
+        english_index = self.english_mode_combo.findData(tts.english_mode)
+        if english_index >= 0:
+            self.english_mode_combo.setCurrentIndex(english_index)
+        self.english_voice_combo.setCurrentText(tts.english_voice)
+        self.learn_terms_check.setChecked(bool(tts.learn_terms))
         self.chars_spin.setValue(int(tts.max_speak_chars))
 
         engine_index = self.engine_combo.findData(tts.engine)
@@ -1301,6 +1410,11 @@ class MainWindow(QMainWindow):
         for widget in (self.silero_label, self.silero_combo):
             widget.setVisible(is_silero)
 
+        # Английский голос нужен только там, где фрагменты уходят Edge.
+        uses_english_voice = self.settings.tts.english_mode in ("auto", "edge")
+        self.english_voice_label.setEnabled(uses_english_voice)
+        self.english_voice_combo.setEnabled(uses_english_voice)
+
         if not is_local:
             self.reference_label.setText("Образец нужен только для Chatterbox")
         elif self.settings.tts.chatterbox_reference:
@@ -1333,6 +1447,23 @@ class MainWindow(QMainWindow):
 
         if engine_id in ("chatterbox", "silero"):
             self._warm_up_engine(engine_id)
+
+    def _warm_up_english(self) -> None:
+        """Грузим английскую модель заранее: первая фраза ждала бы ~3.5 с."""
+        if self.settings.tts.english_mode != "silero_en":
+            return
+
+        def load() -> None:
+            try:
+                from app.engines.silero_en_engine import SileroEnEngine
+
+                engine = SileroEnEngine.instance()
+                if engine.probe().available:
+                    engine._get_model()
+            except Exception:
+                pass      # не скачалась — прочитаем английский голосом Edge
+
+        threading.Thread(target=load, name="mlvh-warm-en", daemon=True).start()
 
     def _warm_up_engine(self, engine_id: str = "chatterbox") -> None:
         """Грузим локальную модель заранее, чтобы первый ответ не ждал."""
@@ -1387,6 +1518,27 @@ class MainWindow(QMainWindow):
         if speaker:
             self.settings.tts.silero_speaker = str(speaker)
             self._touch()
+
+    def _on_english_mode(self, index: int) -> None:
+        if index < 0:
+            return
+        mode = self.english_mode_combo.itemData(index)
+        if mode:
+            self.settings.tts.english_mode = str(mode)
+            self._touch()
+            self._refresh_engine_ui()
+            if str(mode) == "silero_en":
+                self._warm_up_english()
+
+    def _on_english_voice(self, text: str) -> None:
+        voice = text.strip()
+        if voice and voice != self.settings.tts.english_voice:
+            self.settings.tts.english_voice = voice
+            self._touch()
+
+    def _on_learn_terms(self, enabled: bool) -> None:
+        self.settings.tts.learn_terms = bool(enabled)
+        self._touch()
 
     def _on_voice_changed(self, index: int) -> None:
         if index < 0:
@@ -2208,18 +2360,21 @@ class MainWindow(QMainWindow):
     def _refresh_key_state(self) -> None:
         model = self.settings.model
         key = get_api_key(model)
+        # Переменную окружения в подписи не показываем: строка распирала шапку
+        # и окно не сжималось до 1040. Она есть в подсказке.
         if key:
-            self.key_state.setText(f"ключ: {mask_key(key)} ({model.key_env()})")
+            self.key_state.setText(f"ключ: {mask_key(key)}")
             self.key_state.setObjectName("KeyOk")
             self.key_button.setText("Сменить ключ")
         else:
-            self.key_state.setText(f"ключ не задан ({model.key_env()})")
+            self.key_state.setText("ключ не задан")
             self.key_state.setObjectName("KeyMissing")
             self.key_button.setText("Ввести ключ")
         self.key_state.style().unpolish(self.key_state)
         self.key_state.style().polish(self.key_state)
         self.key_state.setToolTip(
-            f"Ответы: {model.provider_name()}, модель {model.name or '—'}"
+            f"Ответы: {model.provider_name()}, модель {model.name or '—'}\n"
+            f"Ключ берётся из переменной {model.key_env()} в файле .env"
         )
 
     def _ask_api_key(self) -> None:
@@ -2539,6 +2694,7 @@ class MainWindow(QMainWindow):
             on_done=self._speech_signals.done.emit,
             on_error=self._speech_signals.error.emit,
             on_note=self._speech_signals.note.emit,
+            model_settings=self.settings.model,   # нужно для обучения терминов
         )
         self._pipeline.start()
         self.statusBar().showMessage("Думаю и говорю…")

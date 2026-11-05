@@ -26,6 +26,46 @@ ENV_PATH = BASE_DIR / ".env"
 load_dotenv(ENV_PATH)
 
 AVAILABLE_MODELS = ("deepseek-flash", "deepseek-v4-pro")
+
+# --- английские вставки в русской речи -----------------------------------
+# Локальные движки латиницу не читают, поэтому английские фрагменты либо
+# переписываем кириллицей (translit), либо отдаём английскому голосу.
+ENGLISH_MODES = ("auto", "translit", "edge", "silero_en", "off")
+# Подписи короткие: длинная строка распирает комбобокс и окно целиком.
+ENGLISH_MODE_TITLES = {
+    "auto": "Авто",
+    "translit": "Русскими буквами",
+    "edge": "Голосом Edge",
+    "silero_en": "Локальной моделью",
+    "off": "Не трогать",
+}
+ENGLISH_MODE_HINTS = {
+    "auto": (
+        "Короткое слово читается по-русски («пайтон») голосом Silero, "
+        "длинная английская фраза — английским голосом."
+    ),
+    "translit": (
+        "Все английские слова переписываются русскими буквами. "
+        "Голос не меняется, интернет не нужен."
+    ),
+    "edge": "Английские фрагменты читает английский голос Edge. Нужен интернет.",
+    "silero_en": (
+        "Английские фрагменты читает локальная модель Silero v3_en (~57 МБ). "
+        "Нужен интернет только для первой загрузки модели."
+    ),
+    "off": "Старое поведение: латиницу Silero и Chatterbox вырезают, слова пропадают.",
+}
+DEFAULT_ENGLISH_VOICE = "en-US-AriaNeural"
+ENGLISH_VOICES = (
+    "en-US-AriaNeural",
+    "en-US-JennyNeural",
+    "en-US-AvaMultilingualNeural",
+    "en-US-EmmaMultilingualNeural",
+    "en-US-GuyNeural",
+    "en-US-AndrewMultilingualNeural",
+    "en-GB-SoniaNeural",
+    "en-GB-RyanNeural",
+)
 DEFAULT_VOICE = "ru-RU-DmitryNeural"
 FALLBACK_VOICES = ("ru-RU-DmitryNeural", "ru-RU-SvetlanaNeural")
 
@@ -196,10 +236,27 @@ class TTSSettings:
     silero_sample_rate: int = 48000
     silero_accent: bool = True             # автоматические ударения
     silero_yo: bool = True                 # буква «ё»
+    # --- английские вставки ---
+    english_mode: str = "auto"             # auto/translit/edge/silero_en/off
+    english_voice: str = DEFAULT_ENGLISH_VOICE
+    learn_terms: bool = False              # спрашивать провайдера о новых словах
+    learn_timeout: float = 30.0            # потолок ожидания ответа словаря
+    learn_fail_limit: int = 2              # неудач подряд до самовыключения
 
     @classmethod
     def from_dict(cls, data: dict) -> "TTSSettings":
-        return cls(**_known_values(cls, data))
+        settings = cls(**_known_values(cls, data))
+        if settings.english_mode not in ENGLISH_MODES:
+            settings.english_mode = "auto"
+        if not str(settings.english_voice).strip():
+            settings.english_voice = DEFAULT_ENGLISH_VOICE
+        try:
+            timeout = float(settings.learn_timeout)
+        except (TypeError, ValueError):
+            timeout = 30.0
+        settings.learn_timeout = max(5.0, min(300.0, timeout))
+        settings.learn_fail_limit = _clamp_int(settings.learn_fail_limit, 2, 1, 10)
+        return settings
 
 
 ASR_MODES = ("off", "push", "wake")
@@ -571,6 +628,11 @@ class Settings:
                 "silero_sample_rate": self.tts.silero_sample_rate,
                 "silero_accent": self.tts.silero_accent,
                 "silero_yo": self.tts.silero_yo,
+                "english_mode": self.tts.english_mode,
+                "english_voice": self.tts.english_voice,
+                "learn_terms": self.tts.learn_terms,
+                "learn_timeout": self.tts.learn_timeout,
+                "learn_fail_limit": self.tts.learn_fail_limit,
             },
             "asr": {
                 "mode": self.asr.mode,

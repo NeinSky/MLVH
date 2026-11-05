@@ -69,7 +69,7 @@ class WhisperEngine(ASREngine):
             title=self.title,
             hint=(
                 "Локальное распознавание, работает офлайн. Модель скачается "
-                f"при первом запуске в {models_dir()}."
+                "при первом запуске в папку models."
             ),
             available=True,
         )
