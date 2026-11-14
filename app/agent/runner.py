@@ -38,6 +38,7 @@ class _Round:
     tool_calls: list[ToolCall]
     usage: dict
     finish: str | None
+    reasoning: str = ""
 
 
 class AgentRunner:
@@ -292,7 +293,9 @@ class AgentRunner:
                     return self._finish(text, usage, rounds, calls, "ok")
 
             # Модель попросила инструменты: assistant-сообщение добавляем целиком.
-            self._messages.append(_assistant_message(result))
+            self._messages.append(
+                _assistant_message(result, thinking=self._client.thinking)
+            )
             executed = 0
             for call in result.tool_calls:
                 if self._cancel.is_set():
@@ -355,6 +358,7 @@ class AgentRunner:
     ) -> _Round:
         client = client or self._client
         parts: list[str] = []
+        thoughts: list[str] = []
         calls: list[ToolCall] = []
         usage: dict = {}
         finish: str | None = None
@@ -367,6 +371,7 @@ class AgentRunner:
                 self._content_parts.append(event.text)
                 self._on_content(event.text)
             elif event.kind == "reasoning":
+                thoughts.append(event.text)
                 self._on_reasoning(event.text)
             elif event.kind == "tool_call" and event.tool_call is not None:
                 calls.append(event.tool_call)
@@ -375,12 +380,22 @@ class AgentRunner:
             elif event.kind == "finish":
                 finish = event.finish_reason
 
-        return _Round("".join(parts), calls, usage, finish)
+        return _Round("".join(parts), calls, usage, finish, "".join(thoughts))
 
 
-def _assistant_message(result: _Round) -> dict:
-    """Сообщение assistant в том виде, в каком его ждёт API."""
+def _assistant_message(result: _Round, thinking: bool = False) -> dict:
+    """Сообщение assistant в том виде, в каком его ждёт API.
+
+    С `tools` в запросе DeepSeek требует вернуть рассуждения этого шага
+    (`reasoning_content`), иначе второй запрос агента получает 400
+    «The `reasoning_content` in the thinking mode must be passed back».
+    Без `tools` рассуждения не нужны, а чужие провайдеры на незнакомое поле
+    в assistant-сообщении отвечают 400 — поэтому пишем его только в режиме
+    рассуждений.
+    """
     message: dict = {"role": "assistant", "content": result.text or None}
+    if result.reasoning and thinking:
+        message["reasoning_content"] = result.reasoning
     if result.tool_calls:
         message["tool_calls"] = [
             {
