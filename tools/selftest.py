@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -1713,6 +1714,51 @@ def test_agent_runner() -> None:
               and reply.usage.get("max_prompt_tokens") == 20,
               str(reply.usage if reply else "None"))
 
+        # DeepSeek с tools требует вернуть reasoning_content шага, иначе второй
+        # запрос получает 400 «must be passed back to the API».
+        thinking_client = FakeClient(
+            [
+                [
+                    StreamEvent(kind="reasoning", text="надо прочитать "),
+                    StreamEvent(kind="reasoning", text="a.txt"),
+                    StreamEvent(
+                        kind="tool_call",
+                        tool_call=ToolCall("2", "read_file", '{"path": "a.txt"}'),
+                    ),
+                ],
+                [StreamEvent(kind="content", text="Готово.")],
+            ]
+        )
+        thinking_client.thinking = True
+        thinking_reply = AgentRunner(
+            thinking_client,
+            base,
+            workspace,
+            limits,
+            context_tokens=100_000,
+            max_tokens=1000,
+        ).run()
+        sent_assistant = [
+            message for message in thinking_client.seen[-1]
+            if message.get("role") == "assistant"
+        ]
+        check("рассуждения шага уходят в историю",
+              bool(sent_assistant)
+              and sent_assistant[0].get("reasoning_content") == "надо прочитать a.txt",
+              str(sent_assistant)[:200])
+        check("ответ после шага с рассуждениями",
+              thinking_reply is not None and "Готово" in thinking_reply.text,
+              thinking_reply.text if thinking_reply else "None")
+
+        plain_assistant = [
+            message for message in client.seen[-1]
+            if message.get("role") == "assistant"
+        ]
+        check("без рассуждений поля нет",
+              bool(plain_assistant)
+              and "reasoning_content" not in plain_assistant[0],
+              str(plain_assistant)[:160])
+
         same = ToolCall("x", "read_file", '{"path": "a.txt"}')
         dup_script = [
             [StreamEvent(kind="tool_call", tool_call=same)] for _ in range(4)
@@ -1877,6 +1923,67 @@ def test_agent_runner() -> None:
         check("результат инструмента обрезается под окно",
               big_reply is not None and last_tokens <= budget,
               f"{last_tokens} > {budget}")
+
+
+def test_error_log() -> None:
+    """Журнал: файл только при ошибке, одна сессия — один файл."""
+    print("журнал ошибок:")
+    import logging
+
+    from app import log_setup
+
+    log_setup.reset_for_tests()
+    with tempfile.TemporaryDirectory(prefix="mlvh_log_") as tmp:
+        directory = Path(tmp) / "errors"
+        check("setup_logging создал каталог",
+              log_setup.setup_logging(directory) == directory, str(directory))
+
+        logging.getLogger("app.test_log").info("обычная строка")
+        logging.getLogger("app.test_log").info("ещё строка")
+        check("без ошибки файла нет",
+              log_setup.current_log_path() is None and not list(directory.glob("*.log")),
+              str(list(directory.iterdir())))
+
+        first = log_setup.flush_error_log()
+        check("ошибка создала файл",
+              first is not None and first.exists(), str(first))
+        check("имя файла — дата и время без двоеточий",
+              first is not None
+              and re.fullmatch(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.log", first.name)
+              is not None,
+              first.name if first else "нет")
+
+        body = first.read_text(encoding="utf-8") if first else ""
+        check("контекст до ошибки попал в файл", "обычная строка" in body,
+              body[:200])
+
+        logging.getLogger("app.test_log").warning("вторая ошибка")
+        second = log_setup.flush_error_log()
+        check("вторая ошибка — тот же файл", second == first, str(second))
+        body = first.read_text(encoding="utf-8") if first else ""
+        check("вторая ошибка дописана", "вторая ошибка" in body, body[-200:])
+        check("файл один", len(list(directory.glob("*.log"))) == 1,
+              str(list(directory.iterdir())))
+        check("INFO сторонних библиотек в журнал не идёт",
+              logging.getLogger("httpx").level == logging.WARNING,
+              str(logging.getLogger("httpx").level))
+        check("подсказка содержит путь",
+              str(first) in log_setup.error_log_hint(), log_setup.error_log_hint())
+
+        log_setup.discard_empty_log()
+        check("журнал с записями не удаляется",
+              first is not None and first.exists(), str(first))
+
+        logging.getLogger("app.test_log").warning("она сама создала файл")
+        path = log_setup.current_log_path()
+        body = path.read_text(encoding="utf-8") if path is not None else ""
+        check("WARNING создаёт файл без flush_error_log",
+              path is not None and path.exists() and "она сама создала файл" in body,
+              str(path))
+        check("в новом журнале есть контекст",
+              "обычная строка" in body, body[:200])
+
+    log_setup.reset_for_tests()
 
 
 def test_core_without_qt() -> None:
@@ -2130,6 +2237,7 @@ def main() -> int:
         test_agent_context,
         test_tool_call_accumulator,
         test_agent_runner,
+        test_error_log,
         test_llm_settings,
         test_llm_client,
         test_llm_probe,

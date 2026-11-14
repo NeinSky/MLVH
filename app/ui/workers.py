@@ -6,6 +6,7 @@ Qt-интерфейс нельзя блокировать сетью, синте
 
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 
@@ -23,7 +24,10 @@ from app.asr.base import ASREngine, ASRError
 from app.config import ASRSettings, TTSSettings
 from app.llm_client import ChatClient, LLMError
 from app.llm_probe import ProbeError, probe_models
+from app.log_setup import flush_error_log
 from app.tts import TTSError, TTSService
+
+log = logging.getLogger(__name__)
 
 
 class ChatWorker(QThread):
@@ -73,7 +77,10 @@ class ChatWorker(QThread):
             self.finished_ok.emit(text, usage)
         except LLMError as exc:
             self.failed.emit(str(exc))
+            flush_error_log()
         except Exception as exc:  # на всякий случай: поток не должен умирать молча
+            log.exception("чат: непредвиденная ошибка")
+            flush_error_log()
             self.failed.emit(f"Непредвиденная ошибка: {exc}")
 
     def _attempt(self, client: ChatClient) -> tuple[str, dict, str | None]:
@@ -148,10 +155,13 @@ class AgentWorker(QThread):
             )
             reply = runner.run()
         except LLMError as exc:
+            flush_error_log()
             if not self._cancel.is_set():
                 self.failed.emit(str(exc))
             return
         except Exception as exc:  # поток не должен умирать молча
+            log.exception("агент: непредвиденная ошибка")
+            flush_error_log()
             if not self._cancel.is_set():
                 self.failed.emit(f"Ошибка агента: {exc}")
             return

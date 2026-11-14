@@ -27,6 +27,9 @@ def _fix_console() -> None:
 
 def main() -> int:
     _fix_console()
+    from app.log_setup import setup_logging
+
+    setup_logging()
     parser = argparse.ArgumentParser(description="MLVH — My Little Voice Helper")
     parser.add_argument(
         "--version",
@@ -388,7 +391,7 @@ def _ask(text: str, settings: Settings, args) -> int:
                 if event.kind == "content":
                     print(event.text, end="", flush=True)
         except LLMError as exc:
-            print(f"\nОшибка: {exc}")
+            _print_error(exc)
             return 1
         print()
         return 0
@@ -420,7 +423,7 @@ def _ask(text: str, settings: Settings, args) -> int:
         )
         reply = runner.run()
     except LLMError as exc:
-        print(f"\nОшибка: {exc}")
+        _print_error(exc)
         return 1
     finally:
         if web is not None:
@@ -439,6 +442,26 @@ def _ask(text: str, settings: Settings, args) -> int:
         f"причина остановки: {reply.stopped}"
     )
     return 0 if reply.text.strip() else 1
+
+
+def _print_error(exc: BaseException) -> None:
+    """Ошибка в консоли + путь к журналу сессии, если он уже создан."""
+    import logging
+
+    from app.log_setup import current_log_path, discard_empty_log, error_log_hint
+    from app.log_setup import flush_error_log
+
+    # Сама ошибка — тоже запись журнала: так в файл попадает и то, что
+    # не дошло до stderr (GUI, чужой поток).
+    logging.getLogger("app.error").warning("%s: %s", type(exc).__name__, exc)
+    flush_error_log()
+    path = current_log_path()
+    if path is not None and path.exists() and path.stat().st_size == 0:
+        discard_empty_log()
+    print(f"\nОшибка: {exc}")
+    hint = error_log_hint()
+    if hint:
+        print(hint)
 
 
 def _run_gui(settings: Settings) -> int:

@@ -27,9 +27,33 @@ if hasattr(sys.stdout, "reconfigure"):
 
 FAILED: list[str] = []
 API_KEY = "test-key"
-MODELS = ("demo", "reason", "reason-native", "tools", "no-stream-options", "no-usage", "missing")
+MODELS = (
+    "demo",
+    "reason",
+    "reason-native",
+    "reason-tools",
+    "strict-reasoning",
+    "tools",
+    "no-stream-options",
+    "no-usage",
+    "missing",
+)
 SEEN: list[dict] = []
 LOCK = threading.Lock()
+
+# Одна схема инструмента: проверяем, что она переживает второй запрос агента.
+_TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "прочитать файл",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+}]
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -52,7 +76,19 @@ def _chunk(model: str, delta: dict, finish: str | None = None) -> dict:
 
 def _chunks(model: str, with_tools: bool) -> list[dict]:
     """Что фейковый провайдер пришлёт для этого алиаса."""
-    if with_tools or model == "tools":
+    if with_tools or model in ("tools", "reason-tools"):
+        if model in ("reason-tools", "strict-reasoning"):
+            # Режим рассуждений: думаем, потом просим инструмент.
+            return [
+                _chunk(model, {"reasoning_content": "думы"}),
+                _chunk(model, {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'},
+                }]}),
+                _chunk(model, {}, "tool_calls"),
+            ]
         return [
             _chunk(model, {"tool_calls": [{
                 "index": 0,
@@ -66,9 +102,9 @@ def _chunks(model: str, with_tools: bool) -> list[dict]:
             }]}),
             _chunk(model, {}, "tool_calls"),
         ]
-    if model == "reason":
+    if model in ("reason", "strict-reasoning"):
         return [
-            _chunk(model, {"reasoning_content": "думаю"}),
+            _chunk(model, {"reasoning_content": "думы"}),
             _chunk(model, {"content": "Ответ"}),
         ]
     if model == "reason-native":
@@ -122,11 +158,38 @@ class _Handler(BaseHTTPRequestHandler):
         if model == "no-stream-options" and "stream_options" in payload:
             self._json(400, {"error": {"message": "unknown field: stream_options"}})
             return
-        if payload.get("thinking"):
+        # strict-reasoning изображает DeepSeek: thinking и рассуждения он понимает.
+        deepseek_like = model == "strict-reasoning"
+        if not deepseek_like and payload.get("thinking"):
             self._json(400, {"error": {"message": "unknown field: thinking"}})
+            return
+        if deepseek_like and self._missing_reasoning(payload):
+            self._json(400, {
+                "error": {
+                    "message": "The `reasoning_content` in the thinking mode must be "
+                               "passed back to the API.",
+                    "type": "invalid_request_error",
+                }
+            })
             return
 
         self._stream(model, bool(payload.get("tools")))
+
+    @staticmethod
+    def _missing_reasoning(payload: dict) -> bool:
+        """Как настоящий DeepSeek: с `tools` история обязана нести рассуждения.
+
+        Проверяем каждый assistant, который просил инструменты: без
+        `reasoning_content` он отвечает 400 на следующий же запрос.
+        """
+        if not payload.get("tools"):
+            return False
+        for message in payload.get("messages") or []:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            if message.get("tool_calls") and not message.get("reasoning_content"):
+                return True
+        return False
 
     def _authorized(self) -> bool:
         if self.headers.get("Authorization") == f"Bearer {API_KEY}":
@@ -206,6 +269,9 @@ def _offline() -> int:
     from app.llm_probe import ProbeError, probe_models
 
     print("Модель: фейковый OpenAI-совместимый сервер")
+    from app.log_setup import setup_logging
+
+    setup_logging()  # журнал в памяти: в консоль INFO не идёт
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     host = f"127.0.0.1:{server.server_port}"
@@ -224,7 +290,7 @@ def _offline() -> int:
 
         print("рассуждения:")
         _, reasoning, _, _ = _collect(client("reason"), messages)
-        check("reasoning_content разобран", reasoning == "думаю", reasoning)
+        check("reasoning_content разобран", reasoning == "думы", reasoning)
         _, reasoning, _, _ = _collect(client("reason-native"), messages)
         check("reasoning разобран", reasoning == "размышляю", reasoning)
 
@@ -300,6 +366,75 @@ def _offline() -> int:
         text, _, _, usage = _collect(client("no-usage"), messages)
         check("ответ без usage не ломается", text == "Привет!" and usage == {},
               f"{text} / {usage}")
+
+        print("рассуждения вместе с инструментами (DeepSeek):")
+        from app.agent.runner import _assistant_message, _Round
+
+        check(
+            "без thinking reasoning_content не уходит",
+            "reasoning_content" not in _assistant_message(_Round("", [], {}, None, "думы")),
+        )
+        turned = _assistant_message(_Round("", [], {}, None, "думы"), thinking=True)
+        check("с thinking reasoning_content возвращается",
+              turned.get("reasoning_content") == "думы", str(turned)[:120])
+        check("пустые рассуждения не добавляются",
+              "reasoning_content" not in _assistant_message(_Round("", [], {}, None), True))
+
+        from app.agent.runner import _Round, _assistant_message
+        from app.llm_client import LLMError
+
+        think_client = ChatClient(
+            api_key=API_KEY, model="strict-reasoning", base_url=base,
+            thinking=True, thinking_style="deepseek",
+        )
+        text, reasoning, calls, _ = _collect(think_client, messages, tools=_TOOLS)
+        check("стрим отдал рассуждения", reasoning == "думы", reasoning)
+        check("стрим отдал вызов инструмента", len(calls) == 1, str(calls))
+        follow = messages + [
+            _assistant_message(
+                _Round(text, calls, {}, "tool_calls", "думы"), thinking=True
+            ),
+            {"role": "tool", "tool_call_id": calls[0].id if calls else "call_1",
+             "content": "содержимое"},
+        ]
+        error = _failure(lambda: _collect(think_client, follow, tools=_TOOLS))
+        check("второй запрос с tools принят (нет 400 про reasoning)",
+              error is None, str(error))
+        with LOCK:
+            sent = SEEN[-1]
+        assistants = [
+            message for message in sent.get("messages", [])
+            if isinstance(message, dict) and message.get("role") == "assistant"
+        ]
+        check("в истории есть reasoning_content",
+              bool(assistants) and "reasoning_content" in assistants[-1],
+              str(assistants)[:160])
+
+        no_reasoning = messages + [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "да"},
+        ]
+        error = _failure(lambda: _collect(think_client, no_reasoning, tools=_TOOLS))
+        check("без поля провайдер отвечает 400 (как в жизни)",
+              isinstance(error, LLMError) and error.status == 400, str(error))
+        check("текст ошибки — про reasoning_content",
+              "reasoning_content" in str(error), str(error))
+        from app.log_setup import current_log_path, flush_error_log
+
+        log_path = flush_error_log()
+        body = ""
+        if log_path is not None and log_path.exists():
+            body = log_path.read_text(encoding="utf-8")
+            log_path.unlink()
+        check("отказ попал в журнал",
+              "отклонил запрос" in body and "strict-reasoning" in body,
+              body[-200:] if body else "журнала нет")
+        check("журнал не содержит текста диалога", "привет" not in body,
+              body[-200:] if body else "")
+        check("путь журнала известен", current_log_path() is not None)
 
         print("по умолчанию DeepSeek:")
         default = ChatClient(api_key="k", model="deepseek-flash")

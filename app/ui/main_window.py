@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -79,6 +80,7 @@ from app.config import (
 from app.engines.registry import engine_infos, get_engine
 from app.engines.silero_engine import SPEAKERS as SILERO_SPEAKERS
 from app.llm_client import ChatClient, LLMError
+from app.log_setup import error_log_hint, flush_error_log, setup_logging
 from app.personas import (
     Persona,
     is_builtin_persona,
@@ -165,6 +167,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self, settings: Settings | None = None) -> None:
         super().__init__()
+        # Окно могут создать и без main(): журнал ошибок включаем здесь же.
+        setup_logging()
         self.settings: Settings = settings or load_settings()
         self.tts = TTSService()
 
@@ -2676,6 +2680,12 @@ class MainWindow(QMainWindow):
 
     def _show_error(self, message: str) -> None:
         self._insert_line("Ошибка: ", message, "#f87171", "#fca5a5")
+        # Ошибка попадает и в журнал: в чате видно текст, в файле — контекст.
+        logging.getLogger("app.error").warning("%s", message)
+        flush_error_log()
+        hint = error_log_hint()
+        if hint:
+            self.statusBar().showMessage(hint, 15000)
 
     # --- озвучка --------------------------------------------------------
     def _start_pipeline(self) -> None:

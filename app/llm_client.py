@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import time
 import urllib.parse
 from dataclasses import dataclass
 from typing import Iterator
@@ -262,14 +263,45 @@ class ChatClient:
         if self._stream_options:
             # Без этого флага часть провайдеров не присылает usage вовсе.
             params["stream_options"] = {"include_usage": True}
+        # Контекст для разбора ошибок: размер истории и наличие tools важнее
+        # всего остального. Сами сообщения не пишем — в них бывают файлы.
+        log.info(
+            "%s: запрос model=%s messages=%d tools=%d thinking=%s",
+            self.label,
+            self.model,
+            len(messages),
+            len(tools or ()),
+            bool(thinking),
+        )
         return params
+
+    def _log_error(self, kind: str, exc: object, status: int | None = None) -> None:
+        """Одна строка на отказ провайдера: тип, код, провайдер, метаданные.
+
+        Ни тела запроса, ни ключа, ни содержимого диалога здесь нет — только
+        то, по чему видно, какой именно запрос не приняли.
+        """
+        log.warning(
+            "%s: %s %s (status=%s, provider=%s, model=%s): %s",
+            self.label,
+            kind,
+            type(exc).__name__,
+            status,
+            self.host,
+            self.model,
+            _short_text(_api_message(exc)),
+        )
 
     def _stream(self, params: dict) -> Iterator[StreamEvent]:
         accumulator = ToolCallAccumulator()
         client, owned = self._request_client()
+        started = time.monotonic()
+        chunks = 0
+        chars = 0
         try:
             stream = client.chat.completions.create(**params)
             for chunk in stream:
+                chunks += 1
                 usage = getattr(chunk, "usage", None)
                 if usage:
                     yield StreamEvent(kind="usage", usage=_usage_to_dict(usage))
@@ -285,48 +317,65 @@ class ChatClient:
                     continue
                 reasoning = _reasoning_text(delta)
                 if reasoning:
+                    chars += len(reasoning)
                     yield StreamEvent(kind="reasoning", text=reasoning)
                 tool_deltas = getattr(delta, "tool_calls", None)
                 if tool_deltas:
                     accumulator.feed(tool_deltas)
                 content = getattr(delta, "content", None)
                 if content:
+                    chars += len(content)
                     yield StreamEvent(kind="content", text=str(content))
             for call in accumulator.finish():
                 yield StreamEvent(kind="tool_call", tool_call=call)
+            log.info(
+                "%s: ответ %d фрагм., %d симв., %.1f с",
+                self.label,
+                chunks,
+                chars,
+                time.monotonic() - started,
+            )
         except openai.AuthenticationError as exc:
+            self._log_error("отклонил ключ", exc, 401)
             raise LLMError(
                 f"{self.label} отклонил ключ (401). Проверьте {self.key_env} в .env.",
                 401,
             ) from exc
         except openai.PermissionDeniedError as exc:
+            self._log_error("нет доступа к модели", exc, 403)
             raise LLMError(
                 f"У ключа нет доступа к модели «{self.model}» ({self.label}, 403).",
                 403,
             ) from exc
         except openai.NotFoundError as exc:
+            self._log_error("модель не найдена", exc, 404)
             raise LLMError(
                 f"Модель «{self.model}» не найдена у {self.label} (404). "
                 "Проверьте алиас модели и адрес API.",
                 404,
             ) from exc
         except openai.RateLimitError as exc:
+            self._log_error("слишком много запросов", exc, 429)
             raise LLMError(
                 f"Слишком много запросов к {self.label} (429). Подождите немного.",
                 429,
             ) from exc
         except openai.APITimeoutError as exc:
+            self._log_error("не ответил вовремя", exc)
             raise LLMError(f"{self.label} не ответил вовремя. Попробуйте ещё раз.") from exc
         except openai.APIConnectionError as exc:
+            self._log_error("нет связи", exc)
             raise LLMError(
                 f"Нет связи с {self.host}. Проверьте интернет, VPN или прокси."
             ) from exc
         except openai.BadRequestError as exc:
+            self._log_error("отклонил запрос", exc, 400)
             raise LLMError(
                 f"{self.label} отклонил запрос (400): {_api_message(exc)}",
                 400,
             ) from exc
         except openai.APIStatusError as exc:
+            self._log_error("вернул ошибку", exc, exc.status_code)
             if exc.status_code == 402:
                 hint = (
                     " Пополните счёт на platform.deepseek.com."
@@ -342,6 +391,7 @@ class ChatClient:
                 exc.status_code,
             ) from exc
         except openai.APIError as exc:
+            self._log_error("ошибка API", exc)
             raise LLMError(f"Ошибка {self.label} API: {exc}") from exc
         except Exception as exc:  # сеть может упасть как угодно, UI не должен падать
             log.exception("Неожиданная ошибка при запросе к %s", self.label)
@@ -409,6 +459,12 @@ def _api_message(exc: object) -> str:
     """Текст ошибки от провайдера, а не «объект по такому-то адресу»."""
     message = str(getattr(exc, "message", "") or "").strip()
     return message or str(exc)
+
+
+def _short_text(text: str, limit: int = 300) -> str:
+    """Текст провайдера одной строкой: в журнале многострочный ответ мешает."""
+    line = " ".join(str(text).split())
+    return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
 def _clamp_int(value: object, default: int) -> int:
