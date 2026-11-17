@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,10 +33,12 @@ MODELS = (
     "reason",
     "reason-native",
     "reason-tools",
+    "reason-empty",
     "strict-reasoning",
     "tools",
     "no-stream-options",
     "no-usage",
+    "reject",
     "missing",
 )
 SEEN: list[dict] = []
@@ -74,8 +77,36 @@ def _chunk(model: str, delta: dict, finish: str | None = None) -> dict:
     }
 
 
-def _chunks(model: str, with_tools: bool) -> list[dict]:
+def _chunks(model: str, payload: dict | None = None) -> list[dict]:
     """Что фейковый провайдер пришлёт для этого алиаса."""
+    payload = payload or {}
+    with_tools = bool(payload.get("tools"))
+    messages = payload.get("messages") or []
+    asked = [
+        message
+        for message in messages
+        if isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and message.get("tool_calls")
+    ]
+    if model == "reason-empty" and with_tools:
+        # Как настоящий DeepSeek в errors/2026-11-17: на первом шаге — только
+        # рассуждения (текста нет), на повторе без рассуждений — инструмент,
+        # после ответа инструмента — итог.
+        thinking_on = (payload.get("thinking") or {}).get("type") == "enabled"
+        if not asked:
+            if thinking_on:
+                return [_chunk(model, {"reasoning_content": "сначала подумаю"})]
+            return [
+                _chunk(model, {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'},
+                }]}),
+                _chunk(model, {}, "tool_calls"),
+            ]
+        return [_chunk(model, {"content": "Там две строки."})]
     if with_tools or model in ("tools", "reason-tools"):
         if model in ("reason-tools", "strict-reasoning"):
             # Режим рассуждений: думаем, потом просим инструмент.
@@ -155,11 +186,16 @@ class _Handler(BaseHTTPRequestHandler):
         if model == "missing":
             self._json(404, {"error": {"message": "model not found"}})
             return
+        if model == "reject":
+            # 400 не про stream_options: повторять запрос без него не нужно.
+            self._json(400, {"error": {"message": "unknown field: temperature"}})
+            return
         if model == "no-stream-options" and "stream_options" in payload:
             self._json(400, {"error": {"message": "unknown field: stream_options"}})
             return
-        # strict-reasoning изображает DeepSeek: thinking и рассуждения он понимает.
-        deepseek_like = model == "strict-reasoning"
+        # strict-reasoning и reason-empty изображают DeepSeek: thinking
+        # и рассуждения они понимают.
+        deepseek_like = model in ("strict-reasoning", "reason-empty")
         if not deepseek_like and payload.get("thinking"):
             self._json(400, {"error": {"message": "unknown field: thinking"}})
             return
@@ -173,16 +209,20 @@ class _Handler(BaseHTTPRequestHandler):
             })
             return
 
-        self._stream(model, bool(payload.get("tools")))
+        self._stream(model, payload)
 
     @staticmethod
     def _missing_reasoning(payload: dict) -> bool:
-        """Как настоящий DeepSeek: с `tools` история обязана нести рассуждения.
+        """Как настоящий DeepSeek: в режиме рассуждений с `tools` история
+        обязана нести рассуждения.
 
         Проверяем каждый assistant, который просил инструменты: без
-        `reasoning_content` он отвечает 400 на следующий же запрос.
+        `reasoning_content` он отвечает 400 на следующий же запрос. Без
+        рассуждений (`thinking` не `enabled`) поле не нужно.
         """
         if not payload.get("tools"):
+            return False
+        if (payload.get("thinking") or {}).get("type") != "enabled":
             return False
         for message in payload.get("messages") or []:
             if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -205,7 +245,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _stream(self, model: str, with_tools: bool) -> None:
+    def _stream(self, model: str, payload: dict) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -213,7 +253,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
-        for chunk in _chunks(model, with_tools):
+        for chunk in _chunks(model, payload):
             self._event(chunk)
         if model != "no-usage":
             self._event({
@@ -265,7 +305,7 @@ def _failure(func):
 
 
 def _offline() -> int:
-    from app.llm_client import ChatClient
+    from app.llm_client import ChatClient, LLMError
     from app.llm_probe import ProbeError, probe_models
 
     print("Модель: фейковый OpenAI-совместимый сервер")
@@ -362,6 +402,20 @@ def _offline() -> int:
             str(attempts[-1].keys()) if attempts else "",
         )
 
+        print("чужой 400 не повторяем:")
+        with LOCK:
+            before = len(SEEN)
+        error = _failure(lambda: _collect(client("reject"), messages))
+        check("400 → LLMError", error is not None and error.status == 400, str(error))
+        with LOCK:
+            attempts = SEEN[before:]
+        check("запрос отправлен один раз", len(attempts) == 1, str(len(attempts)))
+        check(
+            "stream_options не выключен из-за чужого 400",
+            bool(attempts) and "stream_options" in attempts[0],
+            str(attempts[0].keys()) if attempts else "",
+        )
+
         print("usage может отсутствовать:")
         text, _, _, usage = _collect(client("no-usage"), messages)
         check("ответ без usage не ломается", text == "Привет!" and usage == {},
@@ -435,6 +489,47 @@ def _offline() -> int:
         check("журнал не содержит текста диалога", "привет" not in body,
               body[-200:] if body else "")
         check("путь журнала известен", current_log_path() is not None)
+
+        print("пустой ответ в режиме рассуждений (как в errors/2026-11-17):")
+        from app.agent.policy import AgentLimits, Workspace
+        from app.agent.runner import AgentRunner
+
+        agent_client = ChatClient(
+            api_key=API_KEY, model="reason-empty", base_url=base,
+            thinking=True, thinking_style="deepseek",
+        )
+        with tempfile.TemporaryDirectory(prefix="mlvh_llm_") as tmp:
+            root = Path(tmp)
+            (root / "a.txt").write_text(
+                "строка один\nстрока два\n", encoding="utf-8"
+            )
+            limits = AgentLimits(max_rounds=6)
+            try:
+                reply = AgentRunner(
+                    agent_client,
+                    [
+                        {"role": "system", "content": "тест"},
+                        {"role": "user", "content": "что в a.txt?"},
+                    ],
+                    Workspace([root], limits),
+                    limits,
+                    context_tokens=100_000,
+                    max_tokens=1000,
+                ).run()
+            except LLMError as exc:
+                reply = None
+                print(f"  ошибка агента: {exc}")
+        check("после пустого ответа агент дочитал файл",
+              reply is not None and "две строки" in reply.text,
+              reply.text if reply else "None")
+        with LOCK:
+            modes = [
+                (item.get("thinking") or {}).get("type")
+                for item in SEEN
+                if item.get("model") == "reason-empty"
+            ]
+        check("после шага без рассуждений thinking выключен",
+              bool(modes) and modes[-1] == "disabled", str(modes))
 
         print("по умолчанию DeepSeek:")
         default = ChatClient(api_key="k", model="deepseek-flash")

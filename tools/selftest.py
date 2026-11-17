@@ -1609,7 +1609,7 @@ def test_agent_runner() -> None:
     from app.agent.context import context_budget, estimate_message_tokens
     from app.agent.policy import AgentLimits, Workspace
     from app.agent.runner import AgentRunner
-    from app.llm_client import StreamEvent, ToolCall
+    from app.llm_client import LLMError, StreamEvent, ToolCall
 
     class FakeClient:
         model = "fake"
@@ -1758,6 +1758,93 @@ def test_agent_runner() -> None:
               bool(plain_assistant)
               and "reasoning_content" not in plain_assistant[0],
               str(plain_assistant)[:160])
+
+        # Пустой ответ в режиме рассуждений: агент повторяет запрос без них, и
+        # модель просит инструмент. Этот шаг истории останется без
+        # reasoning_content, поэтому дальше рассуждения включать нельзя —
+        # иначе DeepSeek отвечает 400 «must be passed back» (errors/2026-11-17).
+        class DeepSeekFake:
+            """Клиент с правилом DeepSeek: с tools рассуждения обязательны."""
+
+            model = "fake"
+            max_tokens = 1000
+
+            def __init__(self, script, thinking=False, seen=None, modes=None):
+                self.script = script
+                self.thinking = thinking
+                self.seen = seen if seen is not None else []
+                self.modes = modes if modes is not None else []
+
+            def stream_chat(self, messages, tools=None):
+                self.seen.append([dict(message) for message in messages])
+                self.modes.append(self.thinking)
+                if self.thinking and tools:
+                    broken = [
+                        message for message in messages
+                        if message.get("role") == "assistant"
+                        and message.get("tool_calls")
+                        and not message.get("reasoning_content")
+                    ]
+                    if broken:
+                        raise LLMError(
+                            "DeepSeek отклонил запрос (400): The "
+                            "`reasoning_content` in the thinking mode must be "
+                            "passed back to the API.",
+                            400,
+                        )
+                step = self.script.pop(0) if self.script else []
+                if not step:
+                    step = [StreamEvent(kind="content", text="Готово.")]
+                for event in step:
+                    yield event
+
+            def clone(self, *, thinking=None, max_tokens=None):
+                return DeepSeekFake(
+                    self.script,
+                    self.thinking if thinking is None else thinking,
+                    seen=self.seen,
+                    modes=self.modes,
+                )
+
+        deepseek = DeepSeekFake(
+            [
+                [
+                    StreamEvent(kind="reasoning", text="надо прочитать a.txt"),
+                    StreamEvent(
+                        kind="tool_call",
+                        tool_call=ToolCall("d1", "read_file", '{"path": "a.txt"}'),
+                    ),
+                ],
+                [StreamEvent(kind="reasoning", text="думал, но не ответил")],
+                [
+                    StreamEvent(
+                        kind="tool_call",
+                        tool_call=ToolCall(
+                            "d2",
+                            "read_file",
+                            '{"path": "a.txt", "start_line": 1}',
+                        ),
+                    )
+                ],
+                [StreamEvent(kind="content", text="Там две строки.")],
+            ],
+            thinking=True,
+        )
+        deepseek_reply = AgentRunner(
+            deepseek,
+            base,
+            workspace,
+            limits,
+            context_tokens=100_000,
+            max_tokens=1000,
+        ).run()
+        check("после пустого ответа инструменты не ломают историю",
+              deepseek_reply is not None
+              and "две строки" in deepseek_reply.text,
+              deepseek_reply.text if deepseek_reply else "None")
+        check("вопрос продолжился без рассуждений",
+              len(deepseek.modes) == 4 and deepseek.modes[-1] is False,
+              str(deepseek.modes))
 
         same = ToolCall("x", "read_file", '{"path": "a.txt"}')
         dup_script = [

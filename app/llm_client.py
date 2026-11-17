@@ -238,8 +238,15 @@ class ChatClient:
                 yield event
         except LLMError as exc:
             # Провайдер не знает stream_options (обычно локальный сервер):
-            # повторяем один раз без него, если ещё ничего не отдали.
-            if emitted or exc.status != 400 or "stream_options" not in params:
+            # повторяем один раз без него, если ещё ничего не отдали и отказ
+            # действительно про этот параметр. Иначе 400 по другой причине
+            # (например, про `reasoning_content`) повторялся бы впустую.
+            if (
+                emitted
+                or exc.status != 400
+                or "stream_options" not in params
+                or "stream_options" not in str(exc).casefold()
+            ):
                 raise
             log.info("%s отверг stream_options, повторяю без него", self.label)
             self._stream_options = False

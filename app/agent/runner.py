@@ -192,6 +192,11 @@ class AgentRunner:
         no_progress = 0
         forced = False
         retried_without_thinking = False
+        # Клиент, которым идёт этот вопрос. Он может смениться на копию без
+        # рассуждений: DeepSeek с `tools` требует `reasoning_content` у каждого
+        # assistant-сообщения с вызовами, а у шага, полученного без
+        # рассуждений, его нет — и следующий запрос получал 400.
+        client = self._client
 
         while True:
             if self._cancel.is_set():
@@ -222,7 +227,7 @@ class AgentRunner:
                 forced = True
                 self._note(f"Лимит {human} ({detail}): отвечаю по уже прочитанному.")
                 try:
-                    final = self._request(self._final_messages(), None)
+                    final = self._request(self._final_messages(), None, client=client)
                 except LLMError:
                     return self._finish(
                         self._partial_text() or _stop_text(human, detail),
@@ -241,12 +246,14 @@ class AgentRunner:
                 return self._finish(text, usage, rounds, calls, code)
 
             try:
-                result = self._request(self._current_messages(), self._tools)
+                result = self._request(
+                    self._current_messages(), self._tools, client=client
+                )
             except LLMError as exc:
                 # Первый запрос не принял tools (например, прокси) — отвечаем без инструментов.
                 if calls == 0:
                     self._note(f"Инструменты недоступны ({exc}); отвечаю без инструментов.")
-                    result = self._request(self._current_messages(), None)
+                    result = self._request(self._current_messages(), None, client=client)
                 else:
                     raise
             rounds += 1
@@ -258,23 +265,28 @@ class AgentRunner:
 
             if not result.tool_calls:
                 text = result.text.strip()
-                if not text and self._client.thinking and not retried_without_thinking:
+                if not text and client.thinking and not retried_without_thinking:
                     retried_without_thinking = True
                     self._note("Пустой ответ — повторяю без рассуждений…")
                     try:
-                        retry_client = self._client.clone(
+                        quiet = client.clone(
                             thinking=False,
-                            max_tokens=max(self._client.max_tokens, 1500),
+                            max_tokens=max(client.max_tokens, 1500),
                         )
                         result = self._request(
                             self._current_messages(),
                             self._tools,
-                            client=retry_client,
+                            client=quiet,
                         )
                         rounds += 1
                         self._add_usage(usage, result.usage)
                         if result.finish == "length":
                             usage["truncated"] = True
+                        if result.tool_calls:
+                            # Вызовы этого шага остались без reasoning_content:
+                            # дальше только без рассуждений, иначе DeepSeek
+                            # отвечает 400 «must be passed back».
+                            client = quiet
                     except LLMError:
                         pass
                     if self._cancel.is_set():
@@ -292,9 +304,16 @@ class AgentRunner:
                         )
                     return self._finish(text, usage, rounds, calls, "ok")
 
+            # DeepSeek в режиме рассуждений требует reasoning_content у каждого
+            # assistant-сообщения с вызовами. Модель может попросить инструменты
+            # вовсе без рассуждений (пришлось выключить их на пустом ответе или
+            # провайдер их не отдал) — тогда вопрос продолжается без
+            # рассуждений, чтобы история осталась валидной для API.
+            if result.tool_calls and client.thinking and not result.reasoning:
+                client = client.clone(thinking=False)
             # Модель попросила инструменты: assistant-сообщение добавляем целиком.
             self._messages.append(
-                _assistant_message(result, thinking=self._client.thinking)
+                _assistant_message(result, thinking=client.thinking)
             )
             executed = 0
             for call in result.tool_calls:
@@ -390,8 +409,9 @@ def _assistant_message(result: _Round, thinking: bool = False) -> dict:
     (`reasoning_content`), иначе второй запрос агента получает 400
     «The `reasoning_content` in the thinking mode must be passed back».
     Без `tools` рассуждения не нужны, а чужие провайдеры на незнакомое поле
-    в assistant-сообщении отвечают 400 — поэтому пишем его только в режиме
-    рассуждений.
+    в assistant-сообщении отвечают 400 — поэтому пишем его только тогда,
+    когда сам шаг получен в режиме рассуждений: `thinking` — это режим того
+    клиента, которым сделан запрос, а не настройка окна.
     """
     message: dict = {"role": "assistant", "content": result.text or None}
     if result.reasoning and thinking:
